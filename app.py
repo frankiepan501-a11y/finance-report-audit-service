@@ -1,0 +1,178 @@
+# -*- coding: utf-8 -*-
+"""全渠道毛利报表月度审计 (Zeabur)。每月9号16:00 n8n cron → POST /audit。
+检查: 数据缺漏(空报表) / 采购成本覆盖(有销售但cg=0) / 物流头程覆盖。
+异常 → 飞书卡片发财务部 + Frankie, 列 渠道/店铺/负责人/异常, 让财务跟运营核实。
+口径: 只 flag「销售额>0 且 成本=0」(真异常); 销售=0的0成本行忽略。"""
+import os, json, datetime
+from collections import defaultdict
+import requests
+from fastapi import FastAPI, Request, HTTPException
+
+APP_ID = os.environ["FEISHU_APP_ID"]      # 聪哥1号
+APP_SECRET = os.environ["FEISHU_APP_SECRET"]
+AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "")
+FEISHU = "https://open.feishu.cn/open-apis"
+app = FastAPI()
+
+IDX_APP = "P9awbhG9faFstxsO1KZc9b9Qnxb"; IDX_TBL = "tblrProDcHtwD5Vr"  # 公司毛利报表索引
+ML_APP = "WM3LbBr76aRqMys2of8c1dGInEb"; ML_TBL = "tbl09sRPkX35PDfU"   # 美客多报表
+FIN = {"吴晓丹": "ou_c65fc5c31c650790db623640b7ac74f7",
+       "莫莉莉": "ou_73b0e93529a1dab9509274aa756d1064",
+       "林纯子": "ou_eaf3d06fc7f7691352aab69c9e75baee"}
+FRANKIE = "ou_629ce01f4bc31de078e10fcb038dbf78"
+# 跨境报表名 → 字段名(索引表) 映射(取链接拿token)
+XB_FIELDS = ["亚马逊毛利报表", "沃尔玛毛利报表", "速卖通毛利报表", "TikTok Shop毛利报表",
+             "独立站毛利报表", "独立站Powkong Admin API毛利报表"]
+
+
+def tok():
+    r = requests.post(f"{FEISHU}/auth/v3/tenant_access_token/internal",
+                      json={"app_id": APP_ID, "app_secret": APP_SECRET}, timeout=20)
+    return r.json()["tenant_access_token"]
+
+
+def num(x):
+    try: return float(str(x).replace(",", ""))
+    except: return None
+
+
+def ft(v):
+    if isinstance(v, list) and v:
+        x = v[0]; return x.get("text", "") if isinstance(x, dict) else str(x)
+    if isinstance(v, dict): return v.get("text") or v.get("link") or v.get("value") or ""
+    return v if v is not None else ""
+
+
+def colidx(hdr, *keys):
+    for i, h in enumerate(hdr):
+        if h and all(k in h for k in keys): return i
+    return None
+
+
+def _idx_row(T, ym):
+    """取索引表 ym(2026/05) 行的各报表链接。"""
+    items = []; pt = None
+    while True:
+        u = f"{FEISHU}/bitable/v1/apps/{IDX_APP}/tables/{IDX_TBL}/records?page_size=500" + (f"&page_token={pt}" if pt else "")
+        d = requests.get(u, headers={"Authorization": f"Bearer {T}"}, timeout=30).json().get("data", {})
+        items += d.get("items") or []; pt = d.get("page_token")
+        if not d.get("has_more"): break
+    for r in items:
+        f = r["fields"]
+        if ft(f.get("日期")) == ym:
+            return {k: (f.get(k, {}).get("link") if isinstance(f.get(k), dict) else "") for k in XB_FIELDS}
+    return {}
+
+
+def _sheet_token(url):
+    if not url or "/sheets/" not in url: return None
+    return url.split("/sheets/")[1].split("?")[0].split("#")[0]
+
+
+def audit_xb(T, name, ss):
+    """审一个跨境 sheet 报表 → findings。"""
+    H = {"Authorization": f"Bearer {T}"}
+    sh = requests.get(f"{FEISHU}/sheets/v3/spreadsheets/{ss}/sheets/query", headers=H, timeout=30).json()
+    sheets = sh.get("data", {}).get("sheets", [])
+    if not sheets: return [[name, "-", "-", "空报表/数据缺漏", f"{name} 报表无 sheet", 0]]
+    sid = sorted(sheets, key=lambda s: -(s.get("grid_properties", {}).get("row_count") or 0))[0]["sheet_id"]
+    r = requests.get(f"{FEISHU}/sheets/v2/spreadsheets/{ss}/values/{sid}!A1:BZ900?valueRenderOption=ToString", headers=H, timeout=40).json()
+    vals = r.get("data", {}).get("valueRange", {}).get("values") or []
+    hdr = vals[0] if vals else []
+    rows = [v for v in vals[1:] if any(c not in (None, "") for c in v)]
+    if not rows or not any(hdr):
+        return [[name, "-", "-", "空报表/数据缺漏", f"{name} 报表 0 行无数据", 0]]
+    ci = dict(sku=colidx(hdr, "MSKU"), nm=colidx(hdr, "中文名称"), shop=colidx(hdr, "店铺"),
+              own=colidx(hdr, "负责人"), cost=colidx(hdr, "采购成本", "RMB"))
+    ci_sales = colidx(hdr, "销售额", "RMB") or colidx(hdr, "售价", "RMB")
+    out = []
+    for row in rows:
+        def g(i): return row[i] if i is not None and i < len(row) else ""
+        sales = num(g(ci_sales)) or 0; cost = num(g(ci["cost"]))
+        if sales > 0 and (cost == 0 or cost is None):
+            out.append([name, g(ci["shop"]), g(ci["own"]), "采购成本=0(有销售)", f"{g(ci['sku'])} {g(ci['nm'])}", round(sales)])
+    return out
+
+
+def audit_ml(T):
+    H = {"Authorization": f"Bearer {T}"}
+    items = []; pt = None
+    while True:
+        u = f"{FEISHU}/bitable/v1/apps/{ML_APP}/tables/{ML_TBL}/records?page_size=500" + (f"&page_token={pt}" if pt else "")
+        d = requests.get(u, headers=H, timeout=30).json().get("data", {})
+        items += d.get("items") or []; pt = d.get("page_token")
+        if not d.get("has_more"): break
+    last = datetime.date.today().replace(day=1) - datetime.timedelta(days=1)
+    ymd = last.strftime("%Y-%m")
+    out = []
+    for r in items:
+        f = r["fields"]
+        if ymd not in ft(f.get("周期")): continue
+        rev = num(ft(f.get("营收(RMB)"))) or 0; cost = num(ft(f.get("采购成本(RMB)")))
+        if rev > 0 and (cost == 0 or cost is None):
+            out.append(["美客多", ft(f.get("店铺")), "梁俊辉", "采购成本=0(有销售)", f"{ft(f.get('SKU'))} {ft(f.get('商品标题'))[:30]}", round(rev)])
+    return out
+
+
+def build_card(ym, groups, empties):
+    els = [{"tag": "div", "text": {"tag": "lark_md", "content": f"本月毛利报表自动审计（{ym}）发现以下异常，请财务部跟对应运营负责人核实："}}]
+    if not groups and not empties:
+        els.append({"tag": "div", "text": {"tag": "lark_md", "content": "✅ 全渠道无异常：采购成本、物流头程覆盖均正常。"}})
+    for (ch, shop, own), (n, amt, skus) in sorted(groups.items(), key=lambda x: -x[1][1]):
+        els.append({"tag": "hr"})
+        skutxt = " / ".join(skus[:12])
+        els.append({"tag": "div", "text": {"tag": "lark_md", "content": f"**采购成本缺失（毛利虚高）**\n**渠道**：{ch}　**店铺**：{shop}　**负责人**：{own or '待确认'}\n**异常**：{n} 个 SKU 有销售但领星成本=0，涉及金额 **¥{amt:.0f}**\n`{skutxt}`"}})
+    for ch in empties:
+        els.append({"tag": "hr"})
+        els.append({"tag": "div", "text": {"tag": "lark_md", "content": f"**数据缺漏（报表空）**\n**渠道**：{ch}　**异常**：{ym} 报表 0 行无数据 → 请运营确认是否有销售/补传/重新生成"}})
+    els.append({"tag": "hr"})
+    els.append({"tag": "div", "text": {"tag": "lark_md", "content": "📌 审计维度：数据缺漏 / 采购成本覆盖 / 物流头程覆盖。请财务部核实后跟运营负责人推进修复。"}})
+    return {"config": {"wide_screen_mode": True},
+            "header": {"template": "orange", "title": {"tag": "plain_text", "content": f"🟠 [FIN·P1] 全渠道毛利报表审计 · {ym}"}},
+            "elements": els}
+
+
+def do_audit():
+    T = tok()
+    last = datetime.date.today().replace(day=1) - datetime.timedelta(days=1)
+    ym_slash = last.strftime("%Y/%m"); ym_dash = last.strftime("%Y-%m")
+    links = _idx_row(T, ym_slash)
+    findings = []
+    name_map = {"亚马逊毛利报表": "亚马逊", "沃尔玛毛利报表": "沃尔玛", "速卖通毛利报表": "速卖通",
+                "TikTok Shop毛利报表": "TikTok", "独立站毛利报表": "独立站", "独立站Powkong Admin API毛利报表": "独立站Powkong"}
+    for fld, url in links.items():
+        ss = _sheet_token(url)
+        if not ss:
+            findings.append([name_map.get(fld, fld), "-", "-", "空报表/数据缺漏", f"{name_map.get(fld, fld)} {ym_slash} 报表链接缺失", 0]); continue
+        try: findings += audit_xb(T, name_map.get(fld, fld), ss)
+        except Exception as e: findings.append([name_map.get(fld, fld), "-", "-", "审计异常", str(e)[:80], 0])
+    try: findings += audit_ml(T)
+    except Exception: pass
+    groups = defaultdict(lambda: [0, 0.0, []]); empties = []
+    for x in findings:
+        if "空报表" in x[3] or "缺失" in x[3] and "报表" in x[4]:
+            empties.append(x[0]); continue
+        if x[3].startswith("采购成本=0"):
+            k = (x[0], x[1], x[2]); g = groups[k]; g[0] += 1; g[1] += x[5]; g[2].append(x[4].split()[0])
+    empties = sorted(set(empties))
+    card = build_card(ym_dash, groups, empties)
+    sent = []
+    for nm, oid in {**FIN, "Frankie": FRANKIE}.items():
+        try:
+            r = requests.post(f"{FEISHU}/im/v1/messages?receive_id_type=open_id",
+                              headers={"Authorization": f"Bearer {T}", "Content-Type": "application/json"},
+                              json={"receive_id": oid, "msg_type": "interactive", "content": json.dumps(card, ensure_ascii=False)}, timeout=20).json()
+            sent.append(f"{nm}:{r.get('code')}")
+        except Exception as e: sent.append(f"{nm}:err")
+    return {"month": ym_dash, "anomaly_groups": len(groups), "empty_reports": empties, "sent": sent}
+
+
+@app.get("/health")
+def health(): return {"ok": True}
+
+
+@app.post("/audit")
+async def audit(request: Request):
+    if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
+        raise HTTPException(401, "unauthorized")
+    return do_audit()
