@@ -167,6 +167,81 @@ def do_audit():
     return {"month": ym_dash, "anomaly_groups": len(groups), "empty_reports": empties, "sent": sent}
 
 
+# ===== 自动授权: 月报生成后给 财务部全体+Frankie+吴晓丹 授权(铁律①) =====
+FIN_DEPT = "od-ad59abe171a6b0a419a5e3969fb349ad"  # 财务部(实时解析成员, 新人自动包含)
+WXD = "ou_c65fc5c31c650790db623640b7ac74f7"        # 吴晓丹
+# 索引表所有报表字段 → 授权(国内线下=数据app不在此列, 单独权限)
+GRANT_FIELDS = XB_FIELDS + ["美客多毛利报表", "国内电商毛利报表"]
+
+
+def _dept_members(T, did):
+    res = {}; pt = None
+    while True:
+        u = f"{FEISHU}/contact/v3/users?department_id={did}&page_size=50&user_id_type=open_id&department_id_type=open_department_id" + (f"&page_token={pt}" if pt else "")
+        d = requests.get(u, headers={"Authorization": f"Bearer {T}"}, timeout=20).json().get("data", {})
+        for u2 in d.get("items", []): res[u2["open_id"]] = u2.get("name")
+        if d.get("has_more"): pt = d["page_token"]
+        else: break
+    return res
+
+
+def _parse_link(url):
+    if not url: return None, None
+    if "/sheets/" in url: return url.split("/sheets/")[1].split("?")[0].split("#")[0], "sheet"
+    if "/base/" in url: return url.split("/base/")[1].split("?")[0].split("#")[0], "bitable"
+    return None, None
+
+
+def _grant_one(T, token, typ, oid, perm):
+    try:
+        r = requests.post(f"{FEISHU}/drive/v1/permissions/{token}/members?type={typ}&need_notification=false",
+                          headers={"Authorization": f"Bearer {T}", "Content-Type": "application/json"},
+                          json={"member_type": "openid", "member_id": oid, "perm": perm}, timeout=20).json()
+        return r.get("code")
+    except Exception:
+        return -1
+
+
+def _idx_links_all(T, ym_slash):
+    items = []; pt = None
+    while True:
+        u = f"{FEISHU}/bitable/v1/apps/{IDX_APP}/tables/{IDX_TBL}/records?page_size=500" + (f"&page_token={pt}" if pt else "")
+        d = requests.get(u, headers={"Authorization": f"Bearer {T}"}, timeout=30).json().get("data", {})
+        items += d.get("items") or []; pt = d.get("page_token")
+        if not d.get("has_more"): break
+    for r in items:
+        f = r["fields"]
+        if ft(f.get("日期")) == ym_slash:
+            return {k: (f.get(k, {}).get("link") if isinstance(f.get(k), dict) else "") for k in GRANT_FIELDS}
+    return {}
+
+
+def do_grant():
+    T = tok()
+    last = datetime.date.today().replace(day=1) - datetime.timedelta(days=1)
+    ym = last.strftime("%Y/%m")
+    links = _idx_links_all(T, ym)
+    fin = _dept_members(T, FIN_DEPT)  # 财务部全体(实时)
+    granted = []
+    for fld, url in links.items():
+        token, typ = _parse_link(url)
+        if not token: continue
+        _grant_one(T, token, typ, FRANKIE, "full_access")
+        _grant_one(T, token, typ, WXD, "edit")
+        for oid in fin:
+            if oid in (FRANKIE, WXD): continue
+            _grant_one(T, token, typ, oid, "view")
+        granted.append(fld)
+    return {"month": ym, "granted": granted, "finance_members": list(fin.values())}
+
+
+@app.post("/grant")
+async def grant(request: Request):
+    if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
+        raise HTTPException(401, "unauthorized")
+    return do_grant()
+
+
 @app.get("/health")
 def health(): return {"ok": True}
 
