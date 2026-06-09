@@ -114,7 +114,40 @@ def audit_ml(T):
     return out
 
 
-def build_card(ym, groups, empties):
+# ===== 自愈: 发现成本缺口 → 自动触发该渠道重新同步(采购补成本后下次审计自动修复) =====
+ML_SYNC_URL = os.environ.get("ML_SYNC_URL", "https://ml-sync.zeabur.app")
+ML_SYNC_TOKEN = os.environ.get("ML_SYNC_TOKEN", "")
+# 美客多 店铺名关键词 → seller_id (重同步只更新 bitable, 不发通知, 安全)
+ML_SELLER = {"巴西": "2378517428", "FUNLABDIRECTMX": "1407362838", "FUNLAB_MX": "1436420028",
+             "VALMIGOZ": "3383185411", "CBT": "1502520822"}
+
+
+def _ml_seller(shop):
+    for kw, sid in ML_SELLER.items():
+        if kw in (shop or ""): return sid
+    return None
+
+
+def self_heal(groups, ym_dash):
+    """对有成本缺口的渠道触发重新同步。v1 只 ML(安全:bitable更新无广播)。
+    b国内电商/跨境重跑会广播给多人, 暂不自动触发(只告警)。"""
+    healed = []; fired = set()
+    for (ch, shop, own), g in groups.items():
+        if ch == "美客多" and ML_SYNC_TOKEN:
+            sid = _ml_seller(shop)
+            if sid and sid not in fired:
+                fired.add(sid)
+                try:  # fire-and-forget: 网关2m切但服务端继续跑完
+                    requests.post(f"{ML_SYNC_URL}/report/sync-feishu-monthly?seller_id={sid}&month={ym_dash}",
+                                  headers={"Authorization": f"Bearer {ML_SYNC_TOKEN}"}, timeout=6)
+                except Exception:
+                    pass  # 预期超时(fire-and-forget)
+                healed.append(f"美客多·{shop}")
+    return healed
+
+
+def build_card(ym, groups, empties, healed=None):
+    healed = healed or []
     els = [{"tag": "div", "text": {"tag": "lark_md", "content": f"本月毛利报表自动审计（{ym}）发现以下异常，请财务部跟对应运营负责人核实："}}]
     if not groups and not empties:
         els.append({"tag": "div", "text": {"tag": "lark_md", "content": "✅ 全渠道无异常：采购成本、物流头程覆盖均正常。"}})
@@ -125,6 +158,9 @@ def build_card(ym, groups, empties):
     for ch in empties:
         els.append({"tag": "hr"})
         els.append({"tag": "div", "text": {"tag": "lark_md", "content": f"**数据缺漏（报表空）**\n**渠道**：{ch}　**异常**：{ym} 报表 0 行无数据 → 请运营确认是否有销售/补传/重新生成"}})
+    if healed:
+        els.append({"tag": "hr"})
+        els.append({"tag": "div", "text": {"tag": "lark_md", "content": "🔧 **已自动触发重新同步**：" + " / ".join(healed) + "\n（若领星已有成本则约 5 分钟内自动修复；若仍 0 = 采购尚未在领星补成本，请采购补后下次审计自动修）"}})
     els.append({"tag": "hr"})
     els.append({"tag": "div", "text": {"tag": "lark_md", "content": "📌 审计维度：数据缺漏 / 采购成本覆盖 / 物流头程覆盖。请财务部核实后跟运营负责人推进修复。"}})
     return {"config": {"wide_screen_mode": True},
@@ -155,7 +191,8 @@ def do_audit():
         if x[3].startswith("采购成本=0"):
             k = (x[0], x[1], x[2]); g = groups[k]; g[0] += 1; g[1] += x[5]; g[2].append(x[4].split()[0])
     empties = sorted(set(empties))
-    card = build_card(ym_dash, groups, empties)
+    healed = self_heal(groups, ym_dash)
+    card = build_card(ym_dash, groups, empties, healed)
     sent = []
     for nm, oid in {**FIN, "Frankie": FRANKIE}.items():
         try:
@@ -164,7 +201,7 @@ def do_audit():
                               json={"receive_id": oid, "msg_type": "interactive", "content": json.dumps(card, ensure_ascii=False)}, timeout=20).json()
             sent.append(f"{nm}:{r.get('code')}")
         except Exception as e: sent.append(f"{nm}:err")
-    return {"month": ym_dash, "anomaly_groups": len(groups), "empty_reports": empties, "sent": sent}
+    return {"month": ym_dash, "anomaly_groups": len(groups), "empty_reports": empties, "healed": healed, "sent": sent}
 
 
 # ===== 自动授权: 月报生成后给 财务部全体+Frankie+吴晓丹 授权(铁律①) =====
