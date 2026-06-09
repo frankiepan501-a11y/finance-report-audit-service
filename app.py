@@ -236,6 +236,12 @@ CHANNEL_OWNER = {
     "独立站Powkong Admin API毛利报表": (DEPT_ZW, "独立站运营"),
     "国内电商毛利报表": (DEPT_GN, "国内平台运营"),
 }
+# 沃尔玛/速卖通 无专职运营职务 → 按 Frankie 指定的人固定绑(2026-06-09)。
+# 沃尔玛=林明坚(亚马逊运营专员兼) / 速卖通=赵伟俊(国内平台运营专员兼)
+CHANNEL_OWNER_FIXED = {
+    "沃尔玛毛利报表": ["ou_35aa6883c0598bac5c7e06fcb06f7c4d"],   # 林明坚
+    "速卖通毛利报表": ["ou_274ee5199a763b7ec97980cd54e3fecb"],   # 赵伟俊
+}
 _dept_jt_cache = {}
 
 
@@ -254,6 +260,8 @@ def _dept_users_jt(T, did):
 
 
 def _owners_for(T, fld):
+    if fld in CHANNEL_OWNER_FIXED:
+        return CHANNEL_OWNER_FIXED[fld]
     m = CHANNEL_OWNER.get(fld)
     if not m: return []
     did, kw = m
