@@ -222,6 +222,44 @@ def _dept_members(T, did):
     return res
 
 
+# ===== 渠道负责人按职务实时解析(铁律①第3类: 对应渠道运营负责人也自动获权) =====
+DEPT_XB = "od-a69452a48133671d028ac82491c65a9f"   # 跨境电商平台部(亚马逊/美客多)
+DEPT_ZW = "od-5fdbfdf97a0f9c1305c42f39fb729125"   # 站外运营部(TikTok/独立站)
+DEPT_GN = "od-2e75af50a81b16d829e8b345f9137a49"   # 国内电商平台部
+# 渠道报表字段 → (部门, 职务关键词)。按职务实时查 → 人员入离/调岗自动跟随。
+# 沃尔玛/速卖通 暂无专职运营 → 不映射(财务部+Frankie+吴晓丹仍获权), 待 Frankie 指定后补。
+CHANNEL_OWNER = {
+    "亚马逊毛利报表": (DEPT_XB, "亚马逊运营"),
+    "美客多毛利报表": (DEPT_XB, "美客多运营"),
+    "TikTok Shop毛利报表": (DEPT_ZW, "TK运营"),
+    "独立站毛利报表": (DEPT_ZW, "独立站运营"),
+    "独立站Powkong Admin API毛利报表": (DEPT_ZW, "独立站运营"),
+    "国内电商毛利报表": (DEPT_GN, "国内平台运营"),
+}
+_dept_jt_cache = {}
+
+
+def _dept_users_jt(T, did):
+    """部门成员 → [(open_id, job_title)]。请求级缓存(do_grant 开头清), 保持职务实时。"""
+    if did in _dept_jt_cache: return _dept_jt_cache[did]
+    res = []; pt = None
+    while True:
+        u = f"{FEISHU}/contact/v3/users?department_id={did}&page_size=50&user_id_type=open_id&department_id_type=open_department_id" + (f"&page_token={pt}" if pt else "")
+        d = requests.get(u, headers={"Authorization": f"Bearer {T}"}, timeout=20).json().get("data", {})
+        for u2 in d.get("items", []): res.append((u2["open_id"], u2.get("job_title") or ""))
+        if d.get("has_more"): pt = d["page_token"]
+        else: break
+    _dept_jt_cache[did] = res
+    return res
+
+
+def _owners_for(T, fld):
+    m = CHANNEL_OWNER.get(fld)
+    if not m: return []
+    did, kw = m
+    return [oid for oid, jt in _dept_users_jt(T, did) if kw in jt]
+
+
 def _parse_link(url):
     if not url: return None, None
     if "/sheets/" in url: return url.split("/sheets/")[1].split("?")[0].split("#")[0], "sheet"
@@ -255,6 +293,7 @@ def _idx_links_all(T, ym_slash):
 
 def do_grant():
     T = tok()
+    _dept_jt_cache.clear()  # 每次 /grant 重新拉部门成员 → 职务实时
     last = datetime.date.today().replace(day=1) - datetime.timedelta(days=1)
     ym = last.strftime("%Y/%m")
     links = _idx_links_all(T, ym)
@@ -268,7 +307,11 @@ def do_grant():
         for oid in fin:
             if oid in (FRANKIE, WXD): continue
             _grant_one(T, token, typ, oid, "view")
-        granted.append(fld)
+        owners = _owners_for(T, fld)  # 渠道负责人(按职务实时查)
+        for oid in owners:
+            if oid in (FRANKIE, WXD) or oid in fin: continue
+            _grant_one(T, token, typ, oid, "view")
+        granted.append({"report": fld, "owners": len(owners)})
     return {"month": ym, "granted": granted, "finance_members": list(fin.values())}
 
 
