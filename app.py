@@ -330,6 +330,199 @@ async def grant(request: Request):
     return do_grant()
 
 
+# ===================== 全渠道灌总表汇总器 (/aggregate) =====================
+# 读各子报表汇总数 → 每渠道聚合一行 upsert 进总表 tbltFK8vwdcrlfBa(FIN App)。
+# 幂等(月份+渠道大类+平台+店铺)。速卖通/线下c/B2Bd 由各自服务自灌不在此; TikTok 暂不做。
+TOTAL_TBL = "tbltFK8vwdcrlfBa"   # 全渠道销售总览(在 IDX_APP=P9aw...)
+# (索引字段, 渠道大类, 平台[须总表已有选项/空], 店铺label, 品牌[或空], parser)
+AGG_REPORTS = [
+    ("亚马逊毛利报表", "跨境电商", "亚马逊", "亚马逊全站汇总", "", "xb"),
+    ("沃尔玛毛利报表", "跨境电商", "沃尔玛", "沃尔玛全站汇总", "", "xb"),
+    ("独立站毛利报表", "跨境电商", "独立站", "funlab.net Shopify(FUNLAB)", "FUNLAB", "xb"),
+    ("独立站Powkong Admin API毛利报表", "跨境电商", "独立站", "powkong.com Shopify(POWKONG)", "POWKONG", "xb"),
+    ("美客多毛利报表", "跨境电商", "美客多", "美客多5店汇总", "", "ml"),
+    ("国内电商毛利报表", "国内电商", "", "9平台11店汇总", "", "ecom"),
+]
+
+
+def _aggnum(x):
+    try: return float(str(x).replace(",", "").replace("¥", "").replace("%", ""))
+    except: return 0.0
+
+
+def colexact(hdr, name):
+    for i, h in enumerate(hdr):
+        if h == name: return i
+    return None
+
+
+def _bitable_all(T, app, tbl):
+    out = []; pt = None
+    while True:
+        u = f"{FEISHU}/bitable/v1/apps/{app}/tables/{tbl}/records?page_size=500" + (f"&page_token={pt}" if pt else "")
+        d = requests.get(u, headers={"Authorization": f"Bearer {T}"}, timeout=30).json().get("data", {})
+        out += d.get("items") or []; pt = d.get("page_token")
+        if not d.get("has_more"): break
+    return out
+
+
+def _sheet_vals(T, ss, prefer=None):
+    H = {"Authorization": f"Bearer {T}"}
+    sh = requests.get(f"{FEISHU}/sheets/v3/spreadsheets/{ss}/sheets/query", headers=H, timeout=30).json()
+    shs = sh.get("data", {}).get("sheets", []) or []
+    if not shs: return [], None
+    sid = title = None
+    if prefer:
+        for s in shs:
+            if prefer in (s.get("title") or ""): sid, title = s["sheet_id"], s.get("title"); break
+    if not sid:
+        s = sorted(shs, key=lambda s: -((s.get("grid_properties", {}) or {}).get("row_count") or 0))[0]
+        sid, title = s["sheet_id"], s.get("title")
+    r = requests.get(f"{FEISHU}/sheets/v2/spreadsheets/{ss}/values/{sid}!A1:CZ1000?valueRenderOption=UnformattedValue", headers=H, timeout=60).json()
+    return r.get("data", {}).get("valueRange", {}).get("values") or [], title
+
+
+def _agg_xb(T, ss):
+    vals, title = _sheet_vals(T, ss)
+    if not vals: return None
+    hdr = vals[0]; rows = [v for v in vals[1:] if any(c not in (None, "") for c in v)]
+    c = dict(sales=colidx(hdr, "售价", "RMB") or colidx(hdr, "销售额", "RMB"),
+             margin=colidx(hdr, "毛利润", "RMB") or colidx(hdr, "毛利", "RMB"),
+             payback=colidx(hdr, "回款", "RMB"), cost=colidx(hdr, "采购成本", "RMB"),
+             freight=colidx(hdr, "头程", "RMB"), ad1=colidx(hdr, "广告费", "RMB"), ad2=colidx(hdr, "推广费", "RMB"),
+             commission=colidx(hdr, "佣金", "RMB"), deliver=colidx(hdr, "配送费", "RMB"),
+             storage=colidx(hdr, "仓储费", "RMB"), vat=colidx(hdr, "VAT", "RMB"), adj=colidx(hdr, "调整", "RMB"),
+             qty=colexact(hdr, "销量"), rq=colidx(hdr, "退货数量") or colidx(hdr, "退款数量"))
+    a = dict(sales=0, margin=0, payback=0, cost=0, freight=0, ad=0, pf=0, qty=0, rq=0)
+    def g(row, i): return _aggnum(row[i]) if (i is not None and i < len(row)) else 0
+    for row in rows:
+        a["sales"] += g(row, c["sales"]); a["margin"] += g(row, c["margin"]); a["payback"] += g(row, c["payback"])
+        a["cost"] += g(row, c["cost"]); a["freight"] += g(row, c["freight"]); a["ad"] += g(row, c["ad1"]) + g(row, c["ad2"])
+        a["pf"] += g(row, c["commission"]) + g(row, c["deliver"]) + g(row, c["storage"]) + g(row, c["vat"]) + g(row, c["adj"])
+        a["qty"] += g(row, c["qty"]); a["rq"] += g(row, c["rq"])
+    for k in ("cost", "freight", "ad", "pf"): a[k] = abs(a[k])
+    return a
+
+
+def _agg_ecom(T, ss):
+    vals, title = _sheet_vals(T, ss, prefer="毛利结果")
+    if not vals: return None
+    hdr = vals[0]; rows = vals[1:]
+    c = dict(sales=colexact(hdr, "销售额"), margin=colexact(hdr, "毛利额"), pf=colexact(hdr, "平台费合计"),
+             ad=colexact(hdr, "推广/广告费"), cost=colidx(hdr, "采购成本"), freight=colexact(hdr, "物流成本"),
+             qty=colexact(hdr, "销量"), rq=colexact(hdr, "退款数量"))
+    a = dict(sales=0, margin=0, payback=0, cost=0, freight=0, ad=0, pf=0, qty=0, rq=0)
+    def g(row, i): return _aggnum(row[i]) if (i is not None and i < len(row)) else 0
+    for row in rows:
+        if not any(x not in (None, "") for x in row): continue
+        if g(row, c["sales"]) == 0 and g(row, c["margin"]) == 0: continue
+        a["sales"] += g(row, c["sales"]); a["margin"] += g(row, c["margin"]); a["cost"] += g(row, c["cost"])
+        a["freight"] += g(row, c["freight"]); a["ad"] += g(row, c["ad"]); a["pf"] += g(row, c["pf"])
+        a["qty"] += g(row, c["qty"]); a["rq"] += g(row, c["rq"])
+    return a
+
+
+def _agg_ml(T, ym_dash):
+    a = dict(sales=0, margin=0, payback=0, cost=0, freight=0, ad=0, pf=0, qty=0, rq=0)
+    for r in _bitable_all(T, ML_APP, ML_TBL):
+        f = r["fields"]
+        if ym_dash not in ft(f.get("周期")): continue
+        a["sales"] += _aggnum(ft(f.get("营收(RMB)"))); a["margin"] += _aggnum(ft(f.get("全额毛利(RMB)")))
+        a["cost"] += _aggnum(ft(f.get("采购成本(RMB)")))
+        a["freight"] += _aggnum(ft(f.get("物流费(RMB)"))) + _aggnum(ft(f.get("头程成本(RMB)"))) + _aggnum(ft(f.get("海外仓成本(RMB)")))
+        a["ad"] += _aggnum(ft(f.get("广告费(RMB)"))); a["pf"] += _aggnum(ft(f.get("ML佣金(RMB)"))) + _aggnum(ft(f.get("VAT估算(RMB)")))
+        a["qty"] += _aggnum(ft(f.get("销量")))
+    for k in ("cost", "freight", "ad", "pf"): a[k] = abs(a[k])
+    return a
+
+
+def _ensure_payback_cols(T):
+    have = set(); pt = None
+    while True:
+        u = f"{FEISHU}/bitable/v1/apps/{IDX_APP}/tables/{TOTAL_TBL}/fields?page_size=100" + (f"&page_token={pt}" if pt else "")
+        d = requests.get(u, headers={"Authorization": f"Bearer {T}"}, timeout=30).json().get("data", {})
+        for f in d.get("items") or []: have.add(f["field_name"])
+        pt = d.get("page_token")
+        if not d.get("has_more"): break
+    for nm, fmt in (("回款RMB", "0"), ("回款率", "0.00%")):
+        if nm not in have:
+            requests.post(f"{FEISHU}/bitable/v1/apps/{IDX_APP}/tables/{TOTAL_TBL}/fields",
+                          headers={"Authorization": f"Bearer {T}", "Content-Type": "application/json"},
+                          json={"field_name": nm, "type": 2, "property": {"formatter": fmt}}, timeout=20)
+
+
+def _agg_fields(ym_dash, cat, plat, shop, brand, a, url, ptype):
+    mr = a["margin"] / a["sales"] if a["sales"] else 0
+    f = {"月份": ym_dash, "渠道大类": cat, "店铺": shop, "销量": round(a["qty"]) or None, "退款数量": round(a["rq"]) or None,
+         "销售额RMB": round(a["sales"], 2), "采购成本RMB": round(a["cost"], 2) or None, "物流费RMB": round(a["freight"], 2) or None,
+         "广告费RMB": round(a["ad"], 2) or None, "平台费RMB": round(a["pf"], 2) or None, "全额毛利RMB": round(a["margin"], 2),
+         "毛利率": round(mr, 4), "源报表链接": {"link": url, "text": f"{plat or cat}-{ym_dash}"}}
+    if plat: f["平台"] = plat
+    if brand: f["品牌"] = brand
+    if ptype == "xb" and a.get("payback"):   # 回款仅跨境(领星给); 美客多/国内电商口径待财务→空
+        f["回款RMB"] = round(a["payback"], 2)
+        f["回款率"] = round(a["payback"] / a["sales"], 4) if a["sales"] else None
+    return {k: v for k, v in f.items() if v not in (None, "")}
+
+
+def _agg_upsert(T, ym_dash, cat, plat, shop, fields):
+    H = {"Authorization": f"Bearer {T}", "Content-Type": "application/json"}
+    target = None
+    for r in _bitable_all(T, IDX_APP, TOTAL_TBL):
+        ff = r["fields"]
+        if ft(ff.get("月份")) == ym_dash and ft(ff.get("渠道大类")) == cat and ft(ff.get("平台")) == (plat or "") and ft(ff.get("店铺")) == shop:
+            target = r["record_id"]; break
+    if target:
+        requests.put(f"{FEISHU}/bitable/v1/apps/{IDX_APP}/tables/{TOTAL_TBL}/records/{target}", headers=H, json={"fields": fields}, timeout=20)
+        return "update"
+    requests.post(f"{FEISHU}/bitable/v1/apps/{IDX_APP}/tables/{TOTAL_TBL}/records", headers=H, json={"fields": fields}, timeout=20)
+    return "create"
+
+
+def do_aggregate():
+    T = tok()
+    last = datetime.date.today().replace(day=1) - datetime.timedelta(days=1)
+    ym_slash = last.strftime("%Y/%m"); ym_dash = last.strftime("%Y-%m")
+    links = {}
+    for r in _bitable_all(T, IDX_APP, IDX_TBL):
+        f = r["fields"]
+        if ft(f.get("日期")) == ym_slash:
+            for k, v in f.items():
+                if isinstance(v, dict) and v.get("link"): links[k] = v["link"]
+            break
+    _ensure_payback_cols(T)
+    done = []; skipped = []; errs = []
+    for fld, cat, plat, shop, brand, ptype in AGG_REPORTS:
+        url = links.get(fld, "")
+        if not url:
+            skipped.append({"shop": shop, "why": "索引无链接"}); continue
+        try:
+            if ptype == "xb": a = _agg_xb(T, url.split("/sheets/")[1].split("?")[0])
+            elif ptype == "ecom": a = _agg_ecom(T, url.split("/sheets/")[1].split("?")[0])
+            else: a = _agg_ml(T, ym_dash)
+        except Exception as e:
+            errs.append({"shop": shop, "err": str(e)[:100]}); continue
+        if not a or a["sales"] <= 0:
+            skipped.append({"shop": shop, "why": "销售=0(报表未抓到/无单)", "margin": a["margin"] if a else None}); continue
+        fields = _agg_fields(ym_dash, cat, plat, shop, brand, a, url, ptype)
+        act = _agg_upsert(T, ym_dash, cat, plat, shop, fields)
+        done.append({"shop": shop, "act": act, "sales": round(a["sales"]), "margin": round(a["margin"]), "payback": round(a["payback"])})
+    # 总表授权(铁律①): 财务部全体 view + Frankie full + 吴晓丹 edit
+    fin = _dept_members(T, FIN_DEPT)
+    _grant_one(T, IDX_APP, "bitable", FRANKIE, "full_access")
+    _grant_one(T, IDX_APP, "bitable", WXD, "edit")
+    for oid in fin:
+        if oid not in (FRANKIE, WXD): _grant_one(T, IDX_APP, "bitable", oid, "view")
+    return {"month": ym_dash, "loaded": done, "skipped": skipped, "errors": errs, "finance_granted": list(fin.values())}
+
+
+@app.post("/aggregate")
+async def aggregate(request: Request):
+    if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
+        raise HTTPException(401, "unauthorized")
+    return do_aggregate()
+
+
 @app.get("/health")
 def health(): return {"ok": True}
 
