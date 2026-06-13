@@ -334,6 +334,8 @@ async def grant(request: Request):
 # 读各子报表汇总数 → 每渠道聚合一行 upsert 进总表 tbltFK8vwdcrlfBa(FIN App)。
 # 幂等(月份+渠道大类+平台+店铺)。速卖通/线下c/B2Bd 由各自服务自灌不在此; TikTok 暂不做。
 TOTAL_TBL = "tbltFK8vwdcrlfBa"   # 全渠道销售总览(在 IDX_APP=P9aw...)
+# 审计 gate 阈值: 成本缺失金额占渠道销售 > 此% → 挂起不灌(Frankie 2026-06-13 定5%;空报表/0销售永远挂起)
+GATE_PCT = float(os.environ.get("GATE_COST_MISSING_PCT", "5"))
 # (索引字段, 渠道大类, 平台[须总表已有选项/空], 店铺label, 品牌[或空], parser)
 AGG_REPORTS = [
     ("亚马逊毛利报表", "跨境电商", "亚马逊", "亚马逊全站汇总", "", "xb"),
@@ -393,11 +395,13 @@ def _agg_xb(T, ss):
              commission=colidx(hdr, "佣金", "RMB"), deliver=colidx(hdr, "配送费", "RMB"),
              storage=colidx(hdr, "仓储费", "RMB"), vat=colidx(hdr, "VAT", "RMB"), adj=colidx(hdr, "调整", "RMB"),
              qty=colexact(hdr, "销量"), rq=colidx(hdr, "退货数量") or colidx(hdr, "退款数量"))
-    a = dict(sales=0, margin=0, payback=0, cost=0, freight=0, ad=0, pf=0, qty=0, rq=0)
+    a = dict(sales=0, margin=0, payback=0, cost=0, freight=0, ad=0, pf=0, qty=0, rq=0, cm_n=0, cm_amt=0)
     def g(row, i): return _aggnum(row[i]) if (i is not None and i < len(row)) else 0
     for row in rows:
-        a["sales"] += g(row, c["sales"]); a["margin"] += g(row, c["margin"]); a["payback"] += g(row, c["payback"])
-        a["cost"] += g(row, c["cost"]); a["freight"] += g(row, c["freight"]); a["ad"] += g(row, c["ad1"]) + g(row, c["ad2"])
+        rs = g(row, c["sales"]); rc = g(row, c["cost"])
+        if rs > 0 and rc == 0: a["cm_n"] += 1; a["cm_amt"] += rs   # 成本缺失行(销售>0且采购=0)
+        a["sales"] += rs; a["margin"] += g(row, c["margin"]); a["payback"] += g(row, c["payback"])
+        a["cost"] += rc; a["freight"] += g(row, c["freight"]); a["ad"] += g(row, c["ad1"]) + g(row, c["ad2"])
         a["pf"] += g(row, c["commission"]) + g(row, c["deliver"]) + g(row, c["storage"]) + g(row, c["vat"]) + g(row, c["adj"])
         a["qty"] += g(row, c["qty"]); a["rq"] += g(row, c["rq"])
     for k in ("cost", "freight", "ad", "pf"): a[k] = abs(a[k])
@@ -411,24 +415,28 @@ def _agg_ecom(T, ss):
     c = dict(sales=colexact(hdr, "销售额"), margin=colexact(hdr, "毛利额"), pf=colexact(hdr, "平台费合计"),
              ad=colexact(hdr, "推广/广告费"), cost=colidx(hdr, "采购成本"), freight=colexact(hdr, "物流成本"),
              qty=colexact(hdr, "销量"), rq=colexact(hdr, "退款数量"))
-    a = dict(sales=0, margin=0, payback=0, cost=0, freight=0, ad=0, pf=0, qty=0, rq=0)
+    a = dict(sales=0, margin=0, payback=0, cost=0, freight=0, ad=0, pf=0, qty=0, rq=0, cm_n=0, cm_amt=0)
     def g(row, i): return _aggnum(row[i]) if (i is not None and i < len(row)) else 0
     for row in rows:
         if not any(x not in (None, "") for x in row): continue
-        if g(row, c["sales"]) == 0 and g(row, c["margin"]) == 0: continue
-        a["sales"] += g(row, c["sales"]); a["margin"] += g(row, c["margin"]); a["cost"] += g(row, c["cost"])
+        rs = g(row, c["sales"])
+        if rs == 0 and g(row, c["margin"]) == 0: continue
+        if rs > 0 and g(row, c["cost"]) == 0: a["cm_n"] += 1; a["cm_amt"] += rs
+        a["sales"] += rs; a["margin"] += g(row, c["margin"]); a["cost"] += g(row, c["cost"])
         a["freight"] += g(row, c["freight"]); a["ad"] += g(row, c["ad"]); a["pf"] += g(row, c["pf"])
         a["qty"] += g(row, c["qty"]); a["rq"] += g(row, c["rq"])
     return a
 
 
 def _agg_ml(T, ym_dash):
-    a = dict(sales=0, margin=0, payback=0, cost=0, freight=0, ad=0, pf=0, qty=0, rq=0)
+    a = dict(sales=0, margin=0, payback=0, cost=0, freight=0, ad=0, pf=0, qty=0, rq=0, cm_n=0, cm_amt=0)
     for r in _bitable_all(T, ML_APP, ML_TBL):
         f = r["fields"]
         if ym_dash not in ft(f.get("周期")): continue
-        a["sales"] += _aggnum(ft(f.get("营收(RMB)"))); a["margin"] += _aggnum(ft(f.get("全额毛利(RMB)")))
-        a["cost"] += _aggnum(ft(f.get("采购成本(RMB)")))
+        rs = _aggnum(ft(f.get("营收(RMB)"))); rc = _aggnum(ft(f.get("采购成本(RMB)")))
+        if rs > 0 and rc == 0: a["cm_n"] += 1; a["cm_amt"] += rs
+        a["sales"] += rs; a["margin"] += _aggnum(ft(f.get("全额毛利(RMB)")))
+        a["cost"] += rc
         a["freight"] += _aggnum(ft(f.get("物流费(RMB)"))) + _aggnum(ft(f.get("头程成本(RMB)"))) + _aggnum(ft(f.get("海外仓成本(RMB)")))
         a["ad"] += _aggnum(ft(f.get("广告费(RMB)"))); a["pf"] += _aggnum(ft(f.get("ML佣金(RMB)"))) + _aggnum(ft(f.get("VAT估算(RMB)")))
         a["qty"] += _aggnum(ft(f.get("销量")))
@@ -465,18 +473,32 @@ def _agg_fields(ym_dash, cat, plat, shop, brand, a, url, ptype):
     return {k: v for k, v in f.items() if v not in (None, "")}
 
 
-def _agg_upsert(T, ym_dash, cat, plat, shop, fields):
-    H = {"Authorization": f"Bearer {T}", "Content-Type": "application/json"}
-    target = None
+def _agg_find(T, ym_dash, cat, plat, shop):
     for r in _bitable_all(T, IDX_APP, TOTAL_TBL):
         ff = r["fields"]
         if ft(ff.get("月份")) == ym_dash and ft(ff.get("渠道大类")) == cat and ft(ff.get("平台")) == (plat or "") and ft(ff.get("店铺")) == shop:
-            target = r["record_id"]; break
+            return r["record_id"]
+    return None
+
+
+def _agg_upsert(T, ym_dash, cat, plat, shop, fields):
+    H = {"Authorization": f"Bearer {T}", "Content-Type": "application/json"}
+    target = _agg_find(T, ym_dash, cat, plat, shop)
     if target:
         requests.put(f"{FEISHU}/bitable/v1/apps/{IDX_APP}/tables/{TOTAL_TBL}/records/{target}", headers=H, json={"fields": fields}, timeout=20)
         return "update"
     requests.post(f"{FEISHU}/bitable/v1/apps/{IDX_APP}/tables/{TOTAL_TBL}/records", headers=H, json={"fields": fields}, timeout=20)
     return "create"
+
+
+def _agg_delete(T, ym_dash, cat, plat, shop):
+    """gate-fail 时若总表已有该行→删除(保证总表只含审过的渠道)。返回是否删了。"""
+    rid = _agg_find(T, ym_dash, cat, plat, shop)
+    if rid:
+        requests.delete(f"{FEISHU}/bitable/v1/apps/{IDX_APP}/tables/{TOTAL_TBL}/records/{rid}",
+                        headers={"Authorization": f"Bearer {T}"}, timeout=20)
+        return True
+    return False
 
 
 def do_aggregate():
@@ -503,10 +525,17 @@ def do_aggregate():
         except Exception as e:
             errs.append({"shop": shop, "err": str(e)[:100]}); continue
         if not a or a["sales"] <= 0:
-            skipped.append({"shop": shop, "why": "销售=0(报表未抓到/无单)", "margin": a["margin"] if a else None}); continue
+            rm = _agg_delete(T, ym_dash, cat, plat, shop)
+            skipped.append({"shop": shop, "why": "数据缺漏:报表空/0销售", "gate": "fail", "removed_stale": rm}); continue
+        # 审计 gate: 成本缺失>阈值 → 挂起不灌(逐渠道不阻塞; 修好下次cron自动灌); 已有stale行则删
+        cm_amt = a.get("cm_amt", 0); pct = (cm_amt / a["sales"] * 100) if a["sales"] else 0
+        if cm_amt > 0 and pct > GATE_PCT:
+            rm = _agg_delete(T, ym_dash, cat, plat, shop)
+            skipped.append({"shop": shop, "why": f"审计未过:成本缺失{a['cm_n']}SKU ¥{round(cm_amt)}({pct:.1f}%>{GATE_PCT:.0f}%)", "gate": "fail", "removed_stale": rm}); continue
         fields = _agg_fields(ym_dash, cat, plat, shop, brand, a, url, ptype)
         act = _agg_upsert(T, ym_dash, cat, plat, shop, fields)
-        done.append({"shop": shop, "act": act, "sales": round(a["sales"]), "margin": round(a["margin"]), "payback": round(a["payback"])})
+        done.append({"shop": shop, "act": act, "sales": round(a["sales"]), "margin": round(a["margin"]), "payback": round(a["payback"]),
+                     "cost_missing": (f"{a['cm_n']}SKU ¥{round(cm_amt)}" if a.get("cm_n") else None)})
     # 总表授权(铁律①): 财务部全体 view + Frankie full + 吴晓丹 edit
     fin = _dept_members(T, FIN_DEPT)
     _grant_one(T, IDX_APP, "bitable", FRANKIE, "full_access")
@@ -521,6 +550,104 @@ async def aggregate(request: Request):
     if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
         raise HTTPException(401, "unauthorized")
     return do_aggregate()
+
+
+# ===================== 月度汇报推送 (/report-monthly) =====================
+# 全景卡 → 财务部+Frankie; 单渠道卡 → 各渠道负责人(只收自己渠道)。frankie_only=首跑只发Frankie预览。
+# 平台值 → 渠道负责人(职务实时查 jt / 固定 open_id)。平台空(国内电商)按 key="国内电商"。
+REPORT_OWNERS = {
+    "亚马逊": ("jt", DEPT_XB, "亚马逊运营"),
+    "美客多": ("jt", DEPT_XB, "美客多运营"),
+    "独立站": ("jt", DEPT_ZW, "独立站运营"),
+    "国内电商": ("jt", DEPT_GN, "国内平台运营"),
+    "沃尔玛": ("fixed", [("ou_35aa6883c0598bac5c7e06fcb06f7c4d", "林明坚")]),
+    "速卖通": ("fixed", [("ou_274ee5199a763b7ec97980cd54e3fecb", "赵伟俊")]),
+    "线下": ("fixed", [("ou_1314a50710f13f76d1c507fbc9260403", "马建威")]),
+    "B2B": ("fixed", [("ou_8491e70bf70b490f8610852d0550c2dc", "冼浩华")]),
+}
+
+
+def _resolve_owners(T, plat):
+    m = REPORT_OWNERS.get(plat or "国内电商")
+    if not m: return []
+    if m[0] == "fixed": return m[1]
+    _, did, jt = m
+    names = _dept_members(T, did)
+    return [(oid, names.get(oid, "")) for oid, j in _dept_users_jt(T, did) if jt in j]
+
+
+def _send_card(T, oid, card):
+    try:
+        return requests.post(f"{FEISHU}/im/v1/messages?receive_id_type=open_id",
+                             headers={"Authorization": f"Bearer {T}", "Content-Type": "application/json"},
+                             json={"receive_id": oid, "msg_type": "interactive", "content": json.dumps(card, ensure_ascii=False)}, timeout=20).json().get("code")
+    except Exception:
+        return -1
+
+
+def _fmt(x): return f"{x:,.0f}"
+
+
+def _monthly_report(frankie_only=False, dry_run=False):
+    T = tok(); _dept_jt_cache.clear()
+    last = datetime.date.today().replace(day=1) - datetime.timedelta(days=1)
+    ym_dash = last.strftime("%Y-%m")
+    rows = [r for r in _bitable_all(T, IDX_APP, TOTAL_TBL) if ft(r["fields"].get("月份")) == ym_dash]
+    if not rows:
+        return {"month": ym_dash, "note": "总表本月无数据"}
+    rows.sort(key=lambda r: -_aggnum(r["fields"].get("全额毛利RMB")))
+    present = set(ft(r["fields"].get("店铺")) for r in rows)
+    pending = [shop for (_, _, _, shop, _, _) in AGG_REPORTS if shop not in present]
+    tot_s = tot_m = 0
+    rowmeta = []
+    for r in rows:
+        f = r["fields"]; s = _aggnum(f.get("销售额RMB")); m = _aggnum(f.get("全额毛利RMB")); tot_s += s; tot_m += m
+        plat = ft(f.get("平台")); cat = ft(f.get("渠道大类")); pb = f.get("回款RMB")
+        owners = _resolve_owners(T, plat)
+        rowmeta.append({"plat": plat or cat, "cat": cat, "shop": ft(f.get("店铺")), "s": s, "m": m,
+                        "mr": (m / s if s else 0), "pb": _aggnum(pb) if pb else None, "owners": owners})
+    # 全景卡 (财务部+Frankie)
+    tbl = "**渠道 | 销售 | 毛利 | 毛利率 | 回款 | 负责人**\n"
+    for x in rowmeta:
+        ons = "/".join(n for _, n in x["owners"]) or "—"
+        pbs = _fmt(x["pb"]) if x["pb"] is not None else "—"
+        tbl += f"{x['plat']} | {_fmt(x['s'])} | {_fmt(x['m'])} | {x['mr']*100:.1f}% | {pbs} | {ons}\n"
+    tbl += f"**合计 | {_fmt(tot_s)} | {_fmt(tot_m)} | {tot_m/tot_s*100:.1f}% | | **"
+    pend_txt = ("\n\n⏳ **待核未灌**：" + "、".join(pending) + "（审计未过/报表0，见审计卡，修复后次日自动灌）") if pending else ""
+    overview = {"config": {"wide_screen_mode": True},
+                "header": {"template": "blue", "title": {"tag": "plain_text", "content": f"🟡 [FIN·P2] 全渠道毛利月度汇报 · {ym_dash}"}},
+                "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": tbl + pend_txt}},
+                             {"tag": "hr"}, {"tag": "div", "text": {"tag": "lark_md", "content": "📊 已审过才灌总表。回款列：跨境=领星实数，美客多/国内电商待财务口径。"}}]}
+    sent = {"overview": [], "channel": []}
+    if not dry_run:
+        targets = {FRANKIE} if frankie_only else ({FRANKIE} | set(_dept_members(T, FIN_DEPT).keys()))
+        for oid in targets:
+            sent["overview"].append(_send_card(T, oid, overview))
+    # 单渠道卡 → 各负责人
+    for x in rowmeta:
+        if not x["owners"]: continue
+        cm = ""  # (灌入行无成本缺失阻断, 略)
+        card = {"config": {"wide_screen_mode": True},
+                "header": {"template": "turquoise", "title": {"tag": "plain_text", "content": f"🟡 [FIN·P2] {x['plat']}毛利月度汇报 · {ym_dash}"}},
+                "elements": [{"tag": "div", "text": {"tag": "lark_md", "content":
+                    f"**{x['plat']}**（{x['shop']}）\n销售 **¥{_fmt(x['s'])}** · 毛利 **¥{_fmt(x['m'])}**（{x['mr']*100:.1f}%）"
+                    + (f" · 回款 ¥{_fmt(x['pb'])}" if x['pb'] is not None else "") + cm}}]}
+        for oid, nm in x["owners"]:
+            tgt = FRANKIE if frankie_only else oid
+            if not dry_run:
+                sent["channel"].append({"plat": x["plat"], "to": nm if not frankie_only else f"Frankie(代{nm})", "code": _send_card(T, tgt, card)})
+            else:
+                sent["channel"].append({"plat": x["plat"], "to": nm, "code": "dry"})
+    return {"month": ym_dash, "rows": len(rows), "total_sales": round(tot_s), "total_margin": round(tot_m),
+            "pending": pending, "frankie_only": frankie_only, "dry_run": dry_run, "sent": sent}
+
+
+@app.post("/report-monthly")
+async def report_monthly(request: Request):
+    if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
+        raise HTTPException(401, "unauthorized")
+    q = request.query_params
+    return _monthly_report(frankie_only=q.get("frankie_only") == "true", dry_run=q.get("dry_run") == "true")
 
 
 @app.get("/health")
