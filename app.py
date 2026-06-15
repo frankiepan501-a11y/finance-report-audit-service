@@ -134,12 +134,13 @@ def audit_ecom(T, ss):
     hdr = vals[0]
     ci_s = colexact(hdr, "销售额"); ci_c = colidx(hdr, "采购成本"); ci_sku = colexact(hdr, "ERP_SKU(=商家编码)") or colidx(hdr, "商家编码")
     ci_nm = colexact(hdr, "标准产品名称"); ci_shop = colexact(hdr, "店铺")
+    ci_nq = colexact(hdr, "净销量"); ci_ns = colexact(hdr, "净销售额")
     out = []
     for row in vals[1:]:
         def g(i): return row[i] if i is not None and i < len(row) else ""
-        s = num(g(ci_s)) or 0; c = num(g(ci_c))
-        if s > 0 and (c == 0 or c is None):
-            out.append(["国内电商", g(ci_shop), ECOM_OWNER, "采购成本=0(有销售)", f"{g(ci_sku) or '(无SKU)'} {str(g(ci_nm))[:20]}", round(s)])
+        nq = num(g(ci_nq)) or 0; c = num(g(ci_c))
+        if nq > 0 and (c == 0 or c is None):   # 净销量>0才算真缺失(排除全退款单 净销=0)
+            out.append(["国内电商", g(ci_shop), ECOM_OWNER, "采购成本=0(有净销售)", f"{g(ci_sku) or '(无SKU)'} {str(g(ci_nm))[:20]}", round(num(g(ci_ns)))])
     return out
 
 
@@ -477,14 +478,16 @@ def _agg_ecom(T, ss):
     hdr = vals[0]; rows = vals[1:]
     c = dict(sales=colexact(hdr, "销售额"), margin=colexact(hdr, "毛利额"), pf=colexact(hdr, "平台费合计"),
              ad=colexact(hdr, "推广/广告费"), cost=colidx(hdr, "采购成本"), freight=colexact(hdr, "物流成本"),
-             qty=colexact(hdr, "销量"), rq=colexact(hdr, "退款数量"))
+             qty=colexact(hdr, "销量"), rq=colexact(hdr, "退款数量"),
+             netqty=colexact(hdr, "净销量"), netsales=colexact(hdr, "净销售额"))
     a = dict(sales=0, margin=0, payback=0, cost=0, freight=0, ad=0, pf=0, qty=0, rq=0, cm_n=0, cm_amt=0)
     def g(row, i): return _aggnum(row[i]) if (i is not None and i < len(row)) else 0
     for row in rows:
         if not any(x not in (None, "") for x in row): continue
         rs = g(row, c["sales"])
         if rs == 0 and g(row, c["margin"]) == 0: continue
-        if rs > 0 and g(row, c["cost"]) == 0: a["cm_n"] += 1; a["cm_amt"] += rs
+        # 成本缺失=有"净成交"却无采购(用净销量排除全退款单: 毛销>0但净销=0 是退款非缺失)
+        if g(row, c["netqty"]) > 0 and g(row, c["cost"]) == 0: a["cm_n"] += 1; a["cm_amt"] += g(row, c["netsales"])
         a["sales"] += rs; a["margin"] += g(row, c["margin"]); a["cost"] += g(row, c["cost"])
         a["freight"] += g(row, c["freight"]); a["ad"] += g(row, c["ad"]); a["pf"] += g(row, c["pf"])
         a["qty"] += g(row, c["qty"]); a["rq"] += g(row, c["rq"])
