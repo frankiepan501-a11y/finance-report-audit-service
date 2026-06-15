@@ -114,6 +114,63 @@ def audit_ml(T):
     return out
 
 
+# ===== 审计卡扩展: 国内电商/速卖通/c国内线下 成本缺失(2026-06-15) =====
+SMT_UP_TBL = "tbl5Hvrty3oqLdIF"                              # 速卖通月度数据上传台(在 IDX_APP)
+APP_C = "JqZwbSi7uaDlw0sjEFPcTDlenMf"; O_C = "tblJ7Z9cUGTz8fsu"  # c国内线下订单台
+ECOM_OWNER = "赵伟俊"; OFFLINE_OWNER = "马建威"
+
+
+def audit_ecom(T, ss):
+    """国内电商: 读 10_毛利结果表, 销售>0 且 采购成本=0 → 成本缺失。"""
+    if not ss: return []
+    H = {"Authorization": f"Bearer {T}"}
+    sh = requests.get(f"{FEISHU}/sheets/v3/spreadsheets/{ss}/sheets/query", headers=H, timeout=30).json()
+    sheets = sh.get("data", {}).get("sheets", []) or []
+    sid = next((s["sheet_id"] for s in sheets if "毛利结果" in (s.get("title") or "")), None)
+    if not sid: return []
+    r = requests.get(f"{FEISHU}/sheets/v2/spreadsheets/{ss}/values/{sid}!A1:CZ500?valueRenderOption=UnformattedValue", headers=H, timeout=40).json()
+    vals = r.get("data", {}).get("valueRange", {}).get("values") or []
+    if not vals: return []
+    hdr = vals[0]
+    ci_s = colexact(hdr, "销售额"); ci_c = colidx(hdr, "采购成本"); ci_sku = colexact(hdr, "ERP_SKU(=商家编码)") or colidx(hdr, "商家编码")
+    ci_nm = colexact(hdr, "标准产品名称"); ci_shop = colexact(hdr, "店铺")
+    out = []
+    for row in vals[1:]:
+        def g(i): return row[i] if i is not None and i < len(row) else ""
+        s = num(g(ci_s)) or 0; c = num(g(ci_c))
+        if s > 0 and (c == 0 or c is None):
+            out.append(["国内电商", g(ci_shop), ECOM_OWNER, "采购成本=0(有销售)", f"{g(ci_sku) or '(无SKU)'} {str(g(ci_nm))[:20]}", round(s)])
+    return out
+
+
+def audit_offline(T):
+    """c国内线下: 订单台当月 买断/赠样 有产品但 单位成本=0(对照表查不到) → 成本缺失。"""
+    last = datetime.date.today().replace(day=1) - datetime.timedelta(days=1)
+    ym = last.strftime("%Y-%m"); out = []
+    for r in _bitable_all(T, APP_C, O_C):
+        f = r["fields"]; d = ft(f.get("下单/出货日期"))
+        if not str(d).isdigit(): continue
+        if datetime.datetime.utcfromtimestamp(int(d) / 1000).strftime("%Y-%m") != ym: continue
+        way = ft(f.get("合作方式")); prod = ft(f.get("产品名")); cg = num(ft(f.get("单位成本(自动)")))
+        if way in ("经销买断", "赠样") and prod and cg == 0:
+            out.append(["国内线下", ft(f.get("关联经销商")), OFFLINE_OWNER, "采购成本=0(对照表查不到)", prod[:24], round(num(ft(f.get("订单金额"))))])
+    return out
+
+
+def audit_smt(T):
+    """速卖通: 读上传台当月记录摘要, 含「领星缺cg」→ 成本缺失(复用smt已算输出)。"""
+    last = datetime.date.today().replace(day=1) - datetime.timedelta(days=1)
+    ym = last.strftime("%Y-%m"); out = []
+    for r in _bitable_all(T, IDX_APP, SMT_UP_TBL):
+        f = r["fields"]
+        if ym not in ft(f.get("月份")): continue
+        summ = ft(f.get("计算结果摘要"))
+        if "缺cg" in summ:
+            seg = summ.split("缺cg", 1)[1][:60]
+            out.append(["速卖通", "FUNLAB+LinYuvo", ECOM_OWNER, "采购成本=0(领星缺cg)", f"领星缺cg{seg}", 0])
+    return out
+
+
 # ===== 自愈: 发现成本缺口 → 自动触发该渠道重新同步(采购补成本后下次审计自动修复) =====
 ML_SYNC_URL = os.environ.get("ML_SYNC_URL", "https://ml-sync.zeabur.app")
 ML_SYNC_TOKEN = os.environ.get("ML_SYNC_TOKEN", "")
@@ -183,6 +240,12 @@ def do_audit():
         try: findings += audit_xb(T, name_map.get(fld, fld), ss)
         except Exception as e: findings.append([name_map.get(fld, fld), "-", "-", "审计异常", str(e)[:80], 0])
     try: findings += audit_ml(T)
+    except Exception: pass
+    try: findings += audit_ecom(T, _sheet_token(_idx_links_all(T, ym_slash).get("国内电商毛利报表", "")))  # 国内电商
+    except Exception: pass
+    try: findings += audit_offline(T)   # c国内线下
+    except Exception: pass
+    try: findings += audit_smt(T)       # 速卖通
     except Exception: pass
     groups = defaultdict(lambda: [0, 0.0, []]); empties = []
     for x in findings:
