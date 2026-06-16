@@ -406,6 +406,7 @@ AGG_REPORTS = [
     ("沃尔玛毛利报表", "跨境电商", "沃尔玛", "沃尔玛全站汇总", "", "xb"),
     ("独立站毛利报表", "跨境电商", "独立站", "funlab.net Shopify(FUNLAB)", "FUNLAB", "xb"),
     ("独立站Powkong Admin API毛利报表", "跨境电商", "独立站", "powkong.com Shopify(POWKONG)", "POWKONG", "xb"),
+    ("独立站funlabswitch毛利报表", "跨境电商", "独立站", "funlabswitch.com Shopline(FUNLAB)", "FUNLAB", "xb"),  # Shopline大站, sheet schema同xb, 回款列[34]已算(销售-网关费); 替代原手动灌表脚本
     ("美客多毛利报表", "跨境电商", "美客多", "美客多5店汇总", "", "ml"),
     ("国内电商毛利报表", "国内电商", "", "9平台11店汇总", "", "ecom"),
 ]
