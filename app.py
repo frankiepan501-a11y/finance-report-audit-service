@@ -507,6 +507,8 @@ def _agg_ml(T, ym_dash):
         a["freight"] += _aggnum(ft(f.get("物流费(RMB)"))) + _aggnum(ft(f.get("头程成本(RMB)"))) + _aggnum(ft(f.get("海外仓成本(RMB)")))
         a["ad"] += _aggnum(ft(f.get("广告费(RMB)"))); a["pf"] += _aggnum(ft(f.get("ML佣金(RMB)"))) + _aggnum(ft(f.get("VAT估算(RMB)")))
         a["qty"] += _aggnum(ft(f.get("销量")))
+        # 回款(实际到账近似 A): ml-sync 未抓 Mercado Pago settlement → Frankie 口径 fallback = 营收 − ML佣金 − 退款
+        a["payback"] += rs - _aggnum(ft(f.get("ML佣金(RMB)"))) - _aggnum(ft(f.get("退款金额(RMB)")))
     for k in ("cost", "freight", "ad", "pf"): a[k] = abs(a[k])
     return a
 
@@ -541,6 +543,9 @@ def _agg_fields(ym_dash, cat, plat, shop, brand, a, url, ptype):
         pb = a.get("netsales", 0) - abs(a.get("pf", 0))
         f["回款RMB"] = round(pb, 2)
         f["回款率"] = round(pb / a["sales"], 4) if a["sales"] else None
+    if ptype == "ml" and a.get("sales"):     # 美客多回款: ml-sync 未抓 Mercado Pago settlement → fallback=营收−ML佣金−退款(Frankie 2026-06-16 定)
+        f["回款RMB"] = round(a["payback"], 2)
+        f["回款率"] = round(a["payback"] / a["sales"], 4) if a["sales"] else None
     return {k: v for k, v in f.items() if v not in (None, "")}
 
 
