@@ -491,6 +491,7 @@ def _agg_ecom(T, ss):
         a["sales"] += rs; a["margin"] += g(row, c["margin"]); a["cost"] += g(row, c["cost"])
         a["freight"] += g(row, c["freight"]); a["ad"] += g(row, c["ad"]); a["pf"] += g(row, c["pf"])
         a["qty"] += g(row, c["qty"]); a["rq"] += g(row, c["rq"])
+        a["netsales"] = a.get("netsales", 0) + g(row, c["netsales"])   # 回款用(净销售额)
     return a
 
 
@@ -533,9 +534,13 @@ def _agg_fields(ym_dash, cat, plat, shop, brand, a, url, ptype):
          "毛利率": round(mr, 4), "源报表链接": {"link": url, "text": f"{plat or cat}-{ym_dash}"}}
     if plat: f["平台"] = plat
     if brand: f["品牌"] = brand
-    if ptype == "xb" and a.get("payback"):   # 回款仅跨境(领星给); 美客多/国内电商口径待财务→空
+    if ptype == "xb" and a.get("payback"):   # 跨境回款=领星放款金额(实际到账 A)
         f["回款RMB"] = round(a["payback"], 2)
         f["回款率"] = round(a["payback"] / a["sales"], 4) if a["sales"] else None
+    if ptype == "ecom" and a.get("sales"):   # 国内电商回款=净销售额−平台费合计(平台全额结算货款,无reserve,B≈A; Frankie 2026-06-16 定)
+        pb = a.get("netsales", 0) - abs(a.get("pf", 0))
+        f["回款RMB"] = round(pb, 2)
+        f["回款率"] = round(pb / a["sales"], 4) if a["sales"] else None
     return {k: v for k, v in f.items() if v not in (None, "")}
 
 
