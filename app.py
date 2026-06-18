@@ -114,6 +114,38 @@ def audit_ml(T):
     return out
 
 
+# ===== 头程/海外仓覆盖审计(2026-06-18): 美客多有销量但 头程+海外仓全=0 → 待核实货代 =====
+# 场景: 墨客多/三沐等货代未接入(头程缺口) 或 该SKU走CBT自发货/直邮(无头程属正常)。
+# 只做"提醒"不挂起灌总表(头程缺失不像采购成本缺失那样让毛利严重失真)。
+FREIGHT_MIN_REV = float(os.environ.get("ML_FREIGHT_AUDIT_MIN_REV", "1000"))   # 营收阈值,小单不报(降噪)
+FREIGHT_EXCLUDE = set(s.strip() for s in os.environ.get("ML_FREIGHT_AUDIT_EXCLUDE", "").split(",") if s.strip())  # 俊辉确认的自发货/直邮SKU免报
+
+
+def audit_ml_freight(T):
+    """美客多: 营收≥阈值 且 头程成本=0 且 海外仓成本=0 → 头程/海外仓缺失(待核实货代)。
+    排除: 营收<阈值的小单 + ML_FREIGHT_AUDIT_EXCLUDE 列出的已确认自发货/直邮 SKU。"""
+    H = {"Authorization": f"Bearer {T}"}
+    items = []; pt = None
+    while True:
+        u = f"{FEISHU}/bitable/v1/apps/{ML_APP}/tables/{ML_TBL}/records?page_size=500" + (f"&page_token={pt}" if pt else "")
+        d = requests.get(u, headers=H, timeout=30).json().get("data", {})
+        items += d.get("items") or []; pt = d.get("page_token")
+        if not d.get("has_more"): break
+    last = datetime.date.today().replace(day=1) - datetime.timedelta(days=1)
+    ymd = last.strftime("%Y-%m")
+    out = []
+    for r in items:
+        f = r["fields"]
+        if ymd not in ft(f.get("周期")): continue
+        rev = num(ft(f.get("营收(RMB)"))) or 0
+        head = num(ft(f.get("头程成本(RMB)"))) or 0
+        ovs = num(ft(f.get("海外仓成本(RMB)"))) or 0
+        sku = ft(f.get("SKU"))
+        if rev >= FREIGHT_MIN_REV and head == 0 and ovs == 0 and sku not in FREIGHT_EXCLUDE:
+            out.append(["美客多", ft(f.get("店铺")), "梁俊辉", "头程海外仓=0(有销售待核实货代)", f"{sku} {ft(f.get('商品标题'))[:30]}", round(rev)])
+    return out
+
+
 # ===== 审计卡扩展: 国内电商/速卖通/c国内线下 成本缺失(2026-06-15) =====
 SMT_UP_TBL = "tbl5Hvrty3oqLdIF"                              # 速卖通月度数据上传台(在 IDX_APP)
 APP_C = "JqZwbSi7uaDlw0sjEFPcTDlenMf"; O_C = "tblJ7Z9cUGTz8fsu"  # c国内线下订单台
@@ -204,15 +236,19 @@ def self_heal(groups, ym_dash):
     return healed
 
 
-def build_card(ym, groups, empties, healed=None):
-    healed = healed or []
+def build_card(ym, groups, empties, healed=None, freight_groups=None):
+    healed = healed or []; freight_groups = freight_groups or {}
     els = [{"tag": "div", "text": {"tag": "lark_md", "content": f"本月毛利报表自动审计（{ym}）发现以下异常，请财务部跟对应运营负责人核实："}}]
-    if not groups and not empties:
-        els.append({"tag": "div", "text": {"tag": "lark_md", "content": "✅ 全渠道无异常：采购成本、物流头程覆盖均正常。"}})
+    if not groups and not empties and not freight_groups:
+        els.append({"tag": "div", "text": {"tag": "lark_md", "content": "✅ 全渠道无异常：采购成本、头程/海外仓覆盖均正常。"}})
     for (ch, shop, own), (n, amt, skus) in sorted(groups.items(), key=lambda x: -x[1][1]):
         els.append({"tag": "hr"})
         skutxt = " / ".join(skus[:12])
         els.append({"tag": "div", "text": {"tag": "lark_md", "content": f"**采购成本缺失（毛利虚高）**\n**渠道**：{ch}　**店铺**：{shop}　**负责人**：{own or '待确认'}\n**异常**：{n} 个 SKU 有销售但领星成本=0，涉及金额 **¥{amt:.0f}**\n`{skutxt}`"}})
+    for (ch, shop, own), (n, amt, skus) in sorted(freight_groups.items(), key=lambda x: -x[1][1]):
+        els.append({"tag": "hr"})
+        skutxt = " / ".join(skus[:12])
+        els.append({"tag": "div", "text": {"tag": "lark_md", "content": f"**头程/海外仓缺失（毛利虚高，待核实货代）**\n**渠道**：{ch}　**店铺**：{shop}　**负责人**：{own or '待确认'}\n**异常**：{n} 个 SKU 有销售但头程+海外仓成本=0，涉及营收 **¥{amt:.0f}**\n`{skutxt}`\n（应走货代中转→补对接/填发货台ERP-SKU；若CBT自发货/直邮无头程属正常→俊辉确认后加进 ML_FREIGHT_AUDIT_EXCLUDE 免报）"}})
     for ch in empties:
         els.append({"tag": "hr"})
         els.append({"tag": "div", "text": {"tag": "lark_md", "content": f"**数据缺漏（报表空）**\n**渠道**：{ch}　**异常**：{ym} 报表 0 行无数据 → 请运营确认是否有销售/补传/重新生成"}})
@@ -242,21 +278,25 @@ def do_audit():
         except Exception as e: findings.append([name_map.get(fld, fld), "-", "-", "审计异常", str(e)[:80], 0])
     try: findings += audit_ml(T)
     except Exception: pass
+    try: findings += audit_ml_freight(T)   # 头程/海外仓覆盖(2026-06-18)
+    except Exception: pass
     try: findings += audit_ecom(T, _sheet_token(_idx_links_all(T, ym_slash).get("国内电商毛利报表", "")))  # 国内电商
     except Exception: pass
     try: findings += audit_offline(T)   # c国内线下
     except Exception: pass
     try: findings += audit_smt(T)       # 速卖通
     except Exception: pass
-    groups = defaultdict(lambda: [0, 0.0, []]); empties = []
+    groups = defaultdict(lambda: [0, 0.0, []]); freight_groups = defaultdict(lambda: [0, 0.0, []]); empties = []
     for x in findings:
         if "空报表" in x[3] or "缺失" in x[3] and "报表" in x[4]:
             empties.append(x[0]); continue
         if x[3].startswith("采购成本=0"):
             k = (x[0], x[1], x[2]); g = groups[k]; g[0] += 1; g[1] += x[5]; g[2].append(x[4].split()[0])
+        elif x[3].startswith("头程海外仓=0"):
+            k = (x[0], x[1], x[2]); g = freight_groups[k]; g[0] += 1; g[1] += x[5]; g[2].append(x[4].split()[0])
     empties = sorted(set(empties))
-    healed = self_heal(groups, ym_dash)
-    card = build_card(ym_dash, groups, empties, healed)
+    healed = self_heal(groups, ym_dash)   # 仅采购成本缺口自愈(重同步); 头程缺口需接货代,不自愈
+    card = build_card(ym_dash, groups, empties, healed, freight_groups)
     sent = []
     for nm, oid in {**FIN, "Frankie": FRANKIE}.items():
         try:
@@ -265,7 +305,7 @@ def do_audit():
                               json={"receive_id": oid, "msg_type": "interactive", "content": json.dumps(card, ensure_ascii=False)}, timeout=20).json()
             sent.append(f"{nm}:{r.get('code')}")
         except Exception as e: sent.append(f"{nm}:err")
-    return {"month": ym_dash, "anomaly_groups": len(groups), "empty_reports": empties, "healed": healed, "sent": sent}
+    return {"month": ym_dash, "anomaly_groups": len(groups), "freight_groups": len(freight_groups), "empty_reports": empties, "healed": healed, "sent": sent}
 
 
 # ===== 自动授权: 月报生成后给 财务部全体+Frankie+吴晓丹 授权(铁律①) =====
