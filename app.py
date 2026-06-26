@@ -312,7 +312,8 @@ def do_audit():
 FIN_DEPT = "od-ad59abe171a6b0a419a5e3969fb349ad"  # 财务部(实时解析成员, 新人自动包含)
 WXD = "ou_c65fc5c31c650790db623640b7ac74f7"        # 吴晓丹
 # 索引表所有报表字段 → 授权(国内线下=数据app不在此列, 单独权限)
-GRANT_FIELDS = XB_FIELDS + ["美客多毛利报表", "国内电商毛利报表"]
+GRANT_FIELDS = XB_FIELDS + ["美客多毛利报表", "国内电商毛利报表",
+                            "独立站funlab.net毛利报表", "独立站funlabswitch毛利报表", "TEMU毛利报表"]
 
 
 def _dept_members(T, did):
@@ -338,6 +339,8 @@ CHANNEL_OWNER = {
     "TikTok Shop毛利报表": (DEPT_ZW, "TK运营"),
     "独立站毛利报表": (DEPT_ZW, "独立站运营"),
     "独立站Powkong Admin API毛利报表": (DEPT_ZW, "独立站运营"),
+    "独立站funlab.net毛利报表": (DEPT_ZW, "独立站运营"),
+    "独立站funlabswitch毛利报表": (DEPT_ZW, "独立站运营"),
     "国内电商毛利报表": (DEPT_GN, "国内平台运营"),
 }
 # 沃尔玛/速卖通 无专职运营职务 → 按 Frankie 指定的人固定绑(2026-06-09)。
