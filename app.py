@@ -21,6 +21,7 @@ FIN = {"吴晓丹": "ou_c65fc5c31c650790db623640b7ac74f7",
        "林纯子": "ou_eaf3d06fc7f7691352aab69c9e75baee"}
 FRANKIE = "ou_629ce01f4bc31de078e10fcb038dbf78"
 FRANKIE_UNION_ID = os.environ.get("FRANKIE_UNION_ID", "on_6e85dd60606f76f2d5af892785ac1dfe")
+WXD_UNION_ID = os.environ.get("WXD_UNION_ID", "on_854142cacab1e17fe75cb5622ed5112d")
 EVENT_APP_ID = os.environ.get("FEISHU_EVENT_APP_ID", APP_ID)       # 聪哥3号: card sender/callback owner
 EVENT_APP_SECRET = os.environ.get("FEISHU_EVENT_APP_SECRET", "")
 if not EVENT_APP_SECRET:
@@ -363,6 +364,25 @@ def _dept_members(T, did):
         if d.get("has_more"): pt = d["page_token"]
         else: break
     return res
+
+
+def _contact_user(T, open_id):
+    if not open_id:
+        return {}
+    try:
+        r = requests.get(f"{FEISHU}/contact/v3/users/{open_id}?user_id_type=open_id",
+                         headers={"Authorization": f"Bearer {T}"}, timeout=20).json()
+        return (r.get("data") or {}).get("user") or {}
+    except Exception:
+        return {}
+
+
+def _union_id_for_open_id(T, open_id):
+    if open_id == FRANKIE:
+        return FRANKIE_UNION_ID
+    if open_id == WXD:
+        return WXD_UNION_ID
+    return ft(_contact_user(T, open_id).get("union_id"))
 
 
 # ===== 渠道负责人按职务实时解析(铁律①第3类: 对应渠道运营负责人也自动获权) =====
@@ -1108,7 +1128,7 @@ def _company_gap_card(run, gap, *, test_mode=False):
     ])
 
 
-def _company_finance_card(run, *, test_mode=False):
+def _company_finance_card(run, *, test_mode=False, test_note=None):
     rf = run.get("fields", {})
     run_id = ft(rf.get("run_id"))
     period = ft(rf.get("期间"))
@@ -1117,7 +1137,7 @@ def _company_finance_card(run, *, test_mode=False):
     site = ident["site"]
     card_id = _company_card_id("finance_confirm", run_id, platform)
     nonce = str(_now_ms())
-    note = "测试卡，仅发给 Frankie；不会通知财务。" if test_mode else "请确认后再点击，处理结果会自动更新在这张卡片上。"
+    note = (test_note or "测试卡，仅发给 Frankie；不会通知财务。") if test_mode else "请确认后再点击，处理结果会自动更新在这张卡片上。"
     return _company_base_card("🟡 [FIN·P2] 毛利报表终审", "orange", [
         _company_fields([
             ("渠道", platform),
@@ -1142,6 +1162,22 @@ def _company_finance_card(run, *, test_mode=False):
         ]},
         _company_note(note),
     ])
+
+
+def _company_finance_card_recipients(T, mode):
+    recipients = [{"name": "Frankie", "union_id": FRANKIE_UNION_ID}]
+    if mode != "finance_gray":
+        return recipients
+    fin = _dept_members(T, FIN_DEPT)
+    candidates = {"吴晓丹": WXD, **{name: oid for oid, name in fin.items()}}
+    seen = {FRANKIE_UNION_ID}
+    for name, oid in candidates.items():
+        union_id = _union_id_for_open_id(T, oid)
+        if not union_id or union_id in seen:
+            continue
+        seen.add(union_id)
+        recipients.append({"name": name or oid, "union_id": union_id})
+    return recipients
 
 
 def _send_event_card_union(T, union_id, card):
@@ -1372,6 +1408,9 @@ async def profit_workflow_test_cards(request: Request):
     period = q.get("period") or _last_month()
     platform_id = q.get("platform") or "funlabswitch"
     card_type = q.get("card_type") or "both"  # p0_gap / finance / both
+    recipient_mode = q.get("recipient_mode") or "frankie"  # frankie / finance_gray
+    if recipient_mode == "finance_gray" and card_type != "finance":
+        raise HTTPException(400, "recipient_mode=finance_gray only supports card_type=finance")
     send = q.get("send") == "true"
     T = tok()
     run = _company_seed_run(T, period, platform_id)
@@ -1394,18 +1433,23 @@ async def profit_workflow_test_cards(request: Request):
                                             "P0数量": str(_company_open_p0_count(T, run_id)),
                                             "最后动作": "send_finance_test_card"})
             run = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or run
-        cards["finance"] = _company_finance_card(run, test_mode=True)
+        test_note = "测试卡，仅发给 Frankie、吴晓丹和财务部；不会影响真实报表。" if recipient_mode == "finance_gray" else None
+        cards["finance"] = _company_finance_card(run, test_mode=True, test_note=test_note)
 
     sent = {}
     if send:
         ET = event_tok()
+        recipients = _company_finance_card_recipients(T, recipient_mode)
         for name, card in cards.items():
-            res = _send_event_card_union(ET, FRANKIE_UNION_ID, card)
-            mid = (res.get("data") or {}).get("message_id")
-            if mid:
-                _append_company_message_id(T, run_id, mid)
-            sent[name] = {"code": res.get("code"), "message_id": mid}
-    return {"period": period, "platform": platform_id, "run_id": run_id, "frankie_only": True,
+            sent[name] = []
+            for recipient in recipients:
+                res = _send_event_card_union(ET, recipient["union_id"], card)
+                mid = (res.get("data") or {}).get("message_id")
+                if mid:
+                    _append_company_message_id(T, run_id, mid)
+                sent[name].append({"to": recipient["name"], "code": res.get("code"), "message_id": mid})
+    return {"period": period, "platform": platform_id, "run_id": run_id, "frankie_only": recipient_mode == "frankie",
+            "recipient_mode": recipient_mode,
             "card_template": {"schema": COMPANY_CARD_SCHEMA, "version": COMPANY_CARD_TEMPLATE_VERSION},
             "send": send, "sent": sent, "cards": cards if not send else list(cards.keys()),
             "ledger": {"run_table": COMPANY_RUN_TBL, "gap_table": COMPANY_GAP_TBL, "audit_table": COMPANY_AUDIT_TBL}}
