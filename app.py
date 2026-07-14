@@ -3,7 +3,7 @@
 检查: 数据缺漏(空报表) / 采购成本覆盖(有销售但cg=0) / 物流头程覆盖。
 异常 → 飞书卡片发财务部 + Frankie, 列 渠道/店铺/负责人/异常, 让财务跟运营核实。
 口径: 只 flag「销售额>0 且 成本=0」(真异常); 销售=0的0成本行忽略。"""
-import os, json, datetime
+import os, json, datetime, hashlib, time
 from collections import defaultdict
 import requests
 from fastapi import FastAPI, Request, HTTPException
@@ -20,15 +20,52 @@ FIN = {"吴晓丹": "ou_c65fc5c31c650790db623640b7ac74f7",
        "莫莉莉": "ou_73b0e93529a1dab9509274aa756d1064",
        "林纯子": "ou_eaf3d06fc7f7691352aab69c9e75baee"}
 FRANKIE = "ou_629ce01f4bc31de078e10fcb038dbf78"
+FRANKIE_UNION_ID = os.environ.get("FRANKIE_UNION_ID", "on_6e85dd60606f76f2d5af892785ac1dfe")
+EVENT_APP_ID = os.environ.get("FEISHU_EVENT_APP_ID", APP_ID)       # 聪哥3号: card sender/callback owner
+EVENT_APP_SECRET = os.environ.get("FEISHU_EVENT_APP_SECRET", "")
+if not EVENT_APP_SECRET:
+    EVENT_APP_ID, EVENT_APP_SECRET = APP_ID, APP_SECRET
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://finance-report-audit.zeabur.app")
 # 跨境报表名 → 字段名(索引表) 映射(取链接拿token)
 XB_FIELDS = ["亚马逊毛利报表", "沃尔玛毛利报表", "速卖通毛利报表", "TikTok Shop毛利报表",
              "独立站毛利报表", "独立站Powkong Admin API毛利报表"]
 
+# 公司级毛利卡片化 ledger: Base 只做系统账本, 运营/财务通过飞书卡片反馈。
+COMPANY_RUN_TBL = os.environ.get("COMPANY_PROFIT_RUN_TABLE_ID", "tblR2Ft4aN0a6ARh")
+COMPANY_GAP_TBL = os.environ.get("COMPANY_PROFIT_GAP_TABLE_ID", "tblvJaWomx25pAr3")
+COMPANY_AUDIT_TBL = os.environ.get("COMPANY_PROFIT_AUDIT_TABLE_ID", "tblVan2P6bsGb9em")
+COMPANY_CARD_SCHEMA = "company_profit_card_v1"
+
+COMPANY_PLATFORM_REGISTRY = {
+    "amazon": {"name": "Amazon", "platform": "亚马逊", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部"},
+    "walmart": {"name": "Walmart", "platform": "沃尔玛", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部"},
+    "mercadolibre": {"name": "Mercado Libre", "platform": "美客多", "data_mode": "hybrid", "data_status": "数据已就绪", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部"},
+    "funlab_net": {"name": "funlab.net", "platform": "funlab.net", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部"},
+    "powkong": {"name": "Powkong", "platform": "Powkong", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部"},
+    "domestic_ecom": {"name": "国内电商", "platform": "国内电商", "data_mode": "manual", "data_status": "资料已提交", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部"},
+    "funlabswitch": {"name": "funlabswitch", "platform": "funlabswitch", "data_mode": "hybrid", "data_status": "待成本物流维护", "report_status": "P0待处理", "blocker_type": "master_data_gap", "blocker": "采购/负责人"},
+    "aliexpress": {"name": "AliExpress", "platform": "速卖通", "data_mode": "api", "data_status": "取数完成", "report_status": "待接统一终审", "blocker_type": "workflow_gap", "blocker": "AI自动化"},
+    "tiktok_shop": {"name": "TikTok Shop", "platform": "TikTok Shop", "data_mode": "api", "data_status": "取数完成", "report_status": "待接统一终审", "blocker_type": "workflow_gap", "blocker": "AI自动化"},
+    "b2b": {"name": "B2B", "platform": "B2B", "data_mode": "ledger", "data_status": "台账已就绪", "report_status": "待接台账模式", "blocker_type": "workflow_gap", "blocker": "AI自动化"},
+    "offline": {"name": "国内线下", "platform": "国内线下", "data_mode": "ledger", "data_status": "台账已就绪", "report_status": "待接台账模式", "blocker_type": "workflow_gap", "blocker": "AI自动化"},
+    "temu": {"name": "TEMU", "platform": "TEMU", "data_mode": "manual", "data_status": "待资料提交", "report_status": "待定口径", "blocker_type": "finance_rule_gap", "blocker": "财务/负责人"},
+    "taobao": {"name": "淘宝", "platform": "淘宝", "data_mode": "manual", "data_status": "待资料提交", "report_status": "待定口径", "blocker_type": "finance_rule_gap", "blocker": "财务/负责人"},
+    "pinduoduo": {"name": "拼多多", "platform": "拼多多", "data_mode": "manual", "data_status": "待资料提交", "report_status": "待定口径", "blocker_type": "finance_rule_gap", "blocker": "财务/负责人"},
+}
+
+
+def _tok_for(app_id, app_secret):
+    r = requests.post(f"{FEISHU}/auth/v3/tenant_access_token/internal",
+                      json={"app_id": app_id, "app_secret": app_secret}, timeout=20)
+    return r.json()["tenant_access_token"]
+
 
 def tok():
-    r = requests.post(f"{FEISHU}/auth/v3/tenant_access_token/internal",
-                      json={"app_id": APP_ID, "app_secret": APP_SECRET}, timeout=20)
-    return r.json()["tenant_access_token"]
+    return _tok_for(APP_ID, APP_SECRET)
+
+
+def event_tok():
+    return _tok_for(EVENT_APP_ID, EVENT_APP_SECRET)
 
 
 def num(x):
@@ -476,6 +513,154 @@ def _bitable_all(T, app, tbl):
     return out
 
 
+# ===================== 公司级毛利报表卡片化 ledger / callback =====================
+def _now_ms():
+    return int(time.time() * 1000)
+
+
+def _compact_json(value, limit=9000):
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+    return text if len(text) <= limit else text[:limit - 20] + "...[truncated]"
+
+
+def _payload_hash(value):
+    return hashlib.sha256(_compact_json(value, 20000).encode("utf-8")).hexdigest()
+
+
+def _company_platform(platform_id):
+    key = (platform_id or "funlabswitch").strip()
+    if key not in COMPANY_PLATFORM_REGISTRY:
+        raise HTTPException(400, f"unknown platform: {key}")
+    return key, COMPANY_PLATFORM_REGISTRY[key]
+
+
+def _company_run_id(period, platform_id):
+    return f"company-profit-{period}-{platform_id}"
+
+
+def _company_card_id(card_type, run_id, target_id=""):
+    return hashlib.sha1(f"{card_type}:{run_id}:{target_id}".encode("utf-8")).hexdigest()[:12]
+
+
+def _company_idem(action, run_id, card_id, target_id, nonce):
+    raw = f"{COMPANY_CARD_SCHEMA}:{action}:{run_id}:{card_id}:{target_id}:{nonce}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def _bt_find(T, tbl, field, value):
+    for r in _bitable_all(T, IDX_APP, tbl):
+        if ft(r.get("fields", {}).get(field)) == value:
+            return r
+    return None
+
+
+def _bt_write(T, tbl, fields, key_field=None):
+    H = {"Authorization": f"Bearer {T}", "Content-Type": "application/json"}
+    target = _bt_find(T, tbl, key_field, fields.get(key_field)) if key_field and fields.get(key_field) else None
+    if target:
+        requests.put(f"{FEISHU}/bitable/v1/apps/{IDX_APP}/tables/{tbl}/records/{target['record_id']}",
+                     headers=H, json={"fields": fields}, timeout=20)
+        return {"act": "update", "record_id": target["record_id"]}
+    r = requests.post(f"{FEISHU}/bitable/v1/apps/{IDX_APP}/tables/{tbl}/records",
+                      headers=H, json={"fields": fields}, timeout=20).json()
+    return {"act": "create", "record_id": (r.get("data") or {}).get("record", {}).get("record_id")}
+
+
+def _company_seed_run(T, period, platform_id, *, override=None):
+    platform_id, meta = _company_platform(platform_id)
+    run_id = _company_run_id(period, platform_id)
+    fields = {
+        "run_id": run_id,
+        "期间": period,
+        "平台": meta["platform"],
+        "data_mode": meta["data_mode"],
+        "数据状态": meta["data_status"],
+        "报表状态": meta["report_status"],
+        "缺口责任类型": meta.get("blocker_type", ""),
+        "当前阻断方": meta.get("blocker", ""),
+        "P0数量": "1" if meta.get("report_status") == "P0待处理" else "0",
+        "总表状态": "待灌总表" if meta.get("report_status") == "财务通过" else "未灌",
+        "最后动作": "seed_run",
+        "最后动作时间": str(_now_ms()),
+        "payload_json": _compact_json({"platform_id": platform_id, "meta": meta}),
+    }
+    if override:
+        fields.update({k: str(v) if isinstance(v, (int, float, bool)) else v for k, v in override.items()})
+    _bt_write(T, COMPANY_RUN_TBL, fields, "run_id")
+    return _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or {"fields": fields}
+
+
+def _company_create_gap(T, run_id, period, platform, gap_type, detail, *, p_level="P0", owner=""):
+    gap_id = "gap_" + hashlib.sha1(f"{run_id}:{gap_type}:{detail}".encode("utf-8")).hexdigest()[:14]
+    fields = {
+        "gap_id": gap_id,
+        "run_id": run_id,
+        "期间": period,
+        "平台": platform,
+        "缺口责任类型": gap_type,
+        "P级": p_level,
+        "缺口说明": detail,
+        "证据": detail,
+        "责任人": owner,
+        "处理结果": "待处理",
+        "是否可进财务终审": "false",
+        "最后动作": "create_gap",
+        "最后动作时间": str(_now_ms()),
+        "payload_json": _compact_json({"run_id": run_id, "gap_type": gap_type, "detail": detail}),
+    }
+    _bt_write(T, COMPANY_GAP_TBL, fields, "gap_id")
+    return _bt_find(T, COMPANY_GAP_TBL, "gap_id", gap_id) or {"fields": fields}
+
+
+def _company_update_run(T, run_id, fields):
+    fields = dict(fields)
+    fields["最后动作时间"] = str(_now_ms())
+    rec = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id)
+    if not rec:
+        return None
+    H = {"Authorization": f"Bearer {T}", "Content-Type": "application/json"}
+    requests.put(f"{FEISHU}/bitable/v1/apps/{IDX_APP}/tables/{COMPANY_RUN_TBL}/records/{rec['record_id']}",
+                 headers=H, json={"fields": fields}, timeout=20)
+    return _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id)
+
+
+def _company_update_gap(T, gap_id, fields):
+    fields = dict(fields)
+    fields["最后动作时间"] = str(_now_ms())
+    rec = _bt_find(T, COMPANY_GAP_TBL, "gap_id", gap_id)
+    if not rec:
+        return None
+    H = {"Authorization": f"Bearer {T}", "Content-Type": "application/json"}
+    requests.put(f"{FEISHU}/bitable/v1/apps/{IDX_APP}/tables/{COMPANY_GAP_TBL}/records/{rec['record_id']}",
+                 headers=H, json={"fields": fields}, timeout=20)
+    return _bt_find(T, COMPANY_GAP_TBL, "gap_id", gap_id)
+
+
+def _company_audit_exists(T, idempotency_key):
+    return bool(_bt_find(T, COMPANY_AUDIT_TBL, "idempotency_key", idempotency_key))
+
+
+def _company_write_audit(T, idempotency_key, action, actor_open_id, run_id, target_type, target_id,
+                         before, after, payload, result, source_message_id=""):
+    if _company_audit_exists(T, idempotency_key):
+        return
+    _bt_write(T, COMPANY_AUDIT_TBL, {
+        "idempotency_key": idempotency_key,
+        "action": action,
+        "actor_open_id": actor_open_id,
+        "run_id": run_id,
+        "target_type": target_type,
+        "target_id": target_id,
+        "before_json": _compact_json(before),
+        "after_json": _compact_json(after),
+        "payload_hash": _payload_hash(payload),
+        "result": result,
+        "source_message_id": source_message_id,
+        "created_at": str(_now_ms()),
+        "payload_json": _compact_json(payload),
+    }, "idempotency_key")
+
+
 def _sheet_vals(T, ss, prefer=None):
     H = {"Authorization": f"Bearer {T}"}
     sh = requests.get(f"{FEISHU}/sheets/v3/spreadsheets/{ss}/sheets/query", headers=H, timeout=30).json()
@@ -762,12 +947,367 @@ def _monthly_report(frankie_only=False, dry_run=False):
             "pending": pending, "frankie_only": frankie_only, "dry_run": dry_run, "sent": sent}
 
 
+def _company_md(text):
+    return {"tag": "div", "text": {"tag": "lark_md", "content": text}}
+
+
+def _company_note(text):
+    return {"tag": "note", "elements": [{"tag": "plain_text", "content": text}]}
+
+
+def _company_button(text, payload, button_type="default"):
+    return {"tag": "button", "text": {"tag": "plain_text", "content": text}, "type": button_type, "value": payload}
+
+
+def _company_base_card(title, template, elements):
+    return {"config": {"wide_screen_mode": True},
+            "header": {"template": template, "title": {"tag": "plain_text", "content": title}},
+            "elements": elements}
+
+
+def _company_payload(action, run_id, card_type, card_id, *, gap_id="", platform="", period="", decision="", nonce=""):
+    nonce = nonce or str(_now_ms())
+    target_id = gap_id or run_id
+    return {"action": action, "schema_version": COMPANY_CARD_SCHEMA, "run_id": run_id,
+            "card_type": card_type, "card_id": card_id, "gap_id": gap_id, "platform": platform,
+            "period": period, "decision": decision,
+            "idempotency_key": _company_idem(action, run_id, card_id, target_id, nonce)}
+
+
+def _company_processed_card(title, message, ok=True, details=None):
+    details = details or {}
+    extra = "\n\n" + "\n".join(f"- {k}: {v}" for k, v in details.items() if v) if details else ""
+    return _company_base_card(title, "green" if ok else "grey", [
+        _company_md(f"{message}{extra}\n\n此卡片已处理；重复点击不会重复写 Base。")
+    ])
+
+
+def _company_gap_card(run, gap):
+    rf = run.get("fields", {})
+    gf = gap.get("fields", {})
+    run_id = ft(rf.get("run_id"))
+    gap_id = ft(gf.get("gap_id"))
+    period = ft(rf.get("期间")) or ft(gf.get("期间"))
+    platform = ft(rf.get("平台")) or ft(gf.get("平台"))
+    gap_type = ft(gf.get("缺口责任类型")) or ft(rf.get("缺口责任类型"))
+    detail = ft(gf.get("缺口说明")) or ft(gf.get("证据"))
+    card_id = _company_card_id("p0_gap", run_id, gap_id)
+    nonce = str(_now_ms())
+    return _company_base_card(f"🔴 [FIN·P0] 公司毛利报表缺口 · {platform} {period}", "red", [
+        _company_md(
+            f"**run_id**：{run_id}\n"
+            f"**gap_id**：{gap_id}\n"
+            f"**平台**：{platform}\n"
+            f"**期间**：{period}\n"
+            f"**缺口责任类型**：{gap_type}\n"
+            f"**当前阻断方**：{ft(rf.get('当前阻断方')) or ft(gf.get('责任人')) or '-'}\n\n"
+            f"**缺口说明**\n{detail or '待补充'}\n\n"
+            "P0 关闭前不能进入财务终审，也不能灌总表。"
+        ),
+        {"tag": "hr"},
+        {"tag": "action", "actions": [
+            _company_button("已补件，待AI重跑",
+                            _company_payload("company_profit_gap_resolved", run_id, "p0_gap", card_id,
+                                             gap_id=gap_id, platform=platform, period=period, nonce=nonce),
+                            "primary"),
+            _company_button("确认例外，转财务终审",
+                            _company_payload("company_profit_gap_exception", run_id, "p0_gap", card_id,
+                                             gap_id=gap_id, platform=platform, period=period,
+                                             decision="exception", nonce=nonce)),
+        ]},
+        _company_note("Frankie-only P0 测试卡：按钮只写 Base ledger 和 PATCH 原卡，不触达运营/财务。"),
+    ])
+
+
+def _company_finance_card(run):
+    rf = run.get("fields", {})
+    run_id = ft(rf.get("run_id"))
+    period = ft(rf.get("期间"))
+    platform = ft(rf.get("平台"))
+    card_id = _company_card_id("finance_confirm", run_id, platform)
+    nonce = str(_now_ms())
+    return _company_base_card(f"🟡 [FIN·P2] 公司毛利报表财务终审 · {platform} {period}", "orange", [
+        _company_md(
+            f"**run_id**：{run_id}\n"
+            f"**平台**：{platform}\n"
+            f"**data_mode**：{ft(rf.get('data_mode'))}\n"
+            f"**数据状态**：{ft(rf.get('数据状态'))}\n"
+            f"**报表状态**：{ft(rf.get('报表状态'))}\n"
+            f"**总表状态**：{ft(rf.get('总表状态')) or '未灌'}\n\n"
+            "服务端会再次检查 P0：只允许 `P0=0` 或 `P0已确认例外` 的 run 通过终审。"
+        ),
+        {"tag": "hr"},
+        {"tag": "action", "actions": [
+            _company_button("财务通过",
+                            _company_payload("company_profit_finance_approve", run_id, "finance_confirm", card_id,
+                                             platform=platform, period=period, decision="approve", nonce=nonce),
+                            "primary"),
+            _company_button("退回P0处理",
+                            _company_payload("company_profit_finance_return", run_id, "finance_confirm", card_id,
+                                             platform=platform, period=period, decision="return_p0", nonce=nonce)),
+        ]},
+        _company_note("财务通过只推进 ledger 状态；总表仍由 /aggregate 或各平台自灌服务按 gate 写入。"),
+    ])
+
+
+def _send_event_card_union(T, union_id, card):
+    return requests.post(f"{FEISHU}/im/v1/messages?receive_id_type=union_id",
+                         headers={"Authorization": f"Bearer {T}", "Content-Type": "application/json"},
+                         json={"receive_id": union_id, "msg_type": "interactive",
+                               "content": json.dumps(card, ensure_ascii=False)}, timeout=20).json()
+
+
+def _send_event_card_open_id(T, open_id, card):
+    return requests.post(f"{FEISHU}/im/v1/messages?receive_id_type=open_id",
+                         headers={"Authorization": f"Bearer {T}", "Content-Type": "application/json"},
+                         json={"receive_id": open_id, "msg_type": "interactive",
+                               "content": json.dumps(card, ensure_ascii=False)}, timeout=20).json()
+
+
+def _patch_message_card(T, message_id, card):
+    if not message_id:
+        return {"code": -1, "msg": "no message_id"}
+    return requests.patch(f"{FEISHU}/im/v1/messages/{message_id}",
+                          headers={"Authorization": f"Bearer {T}", "Content-Type": "application/json"},
+                          json={"content": json.dumps(card, ensure_ascii=False)}, timeout=20).json()
+
+
+def _append_company_message_id(T, run_id, message_id):
+    if not message_id:
+        return
+    rec = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id)
+    if not rec:
+        return
+    old = ft(rec.get("fields", {}).get("原卡message_ids"))
+    parts = [p for p in old.split(",") if p] if old else []
+    if message_id not in parts:
+        parts.append(message_id)
+    _company_update_run(T, run_id, {"原卡message_ids": ",".join(parts), "最后动作": "append_message_id"})
+
+
+def _deep_get(obj, path):
+    cur = obj
+    for key in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    return cur
+
+
+def _parse_card_value(raw):
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            v = json.loads(raw)
+            return v if isinstance(v, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _company_callback_context(body):
+    value = (_deep_get(body, ["event", "action", "value"]) or
+             _deep_get(body, ["body", "event", "action", "value"]) or
+             _deep_get(body, ["action", "value"]) or body.get("card_action") or body.get("value") or {})
+    operator_open_id = (_deep_get(body, ["event", "operator", "open_id"]) or
+                        _deep_get(body, ["body", "event", "operator", "open_id"]) or
+                        _deep_get(body, ["operator", "open_id"]) or body.get("operator_open_id") or "")
+    message_id = (_deep_get(body, ["event", "context", "open_message_id"]) or
+                  _deep_get(body, ["body", "event", "context", "open_message_id"]) or
+                  _deep_get(body, ["event", "open_message_id"]) or
+                  _deep_get(body, ["data", "card_open_message_id"]) or
+                  body.get("open_message_id") or body.get("message_id") or "")
+    chat_id = (_deep_get(body, ["event", "context", "open_chat_id"]) or
+               _deep_get(body, ["body", "event", "context", "open_chat_id"]) or
+               body.get("open_chat_id") or body.get("chat_id") or "")
+    form_value = (_deep_get(body, ["event", "action", "form_value"]) or
+                  _deep_get(body, ["body", "event", "action", "form_value"]) or
+                  body.get("card_form_value") or {})
+    return {"value": _parse_card_value(value), "operator_open_id": operator_open_id,
+            "message_id": message_id, "chat_id": chat_id, "form_value": form_value}
+
+
+def _company_open_p0_count(T, run_id):
+    n = 0
+    for rec in _bitable_all(T, IDX_APP, COMPANY_GAP_TBL):
+        f = rec.get("fields", {})
+        if ft(f.get("run_id")) != run_id:
+            continue
+        if ft(f.get("P级")) == "P0" and ft(f.get("处理结果")) not in ("已补件", "确认例外", "已关闭"):
+            n += 1
+    return n
+
+
+def _patch_or_fallback(ctx, card):
+    T = event_tok()
+    if ctx.get("message_id"):
+        patched = _patch_message_card(T, ctx["message_id"], card)
+        if patched.get("code") == 0:
+            return {"patched_original_card": True, "response": patched}
+    if ctx.get("operator_open_id"):
+        sent = _send_event_card_open_id(T, ctx["operator_open_id"], card)
+        if sent.get("code") == 99992361 and FRANKIE_UNION_ID:
+            union_sent = _send_event_card_union(T, FRANKIE_UNION_ID, card)
+            return {"fallback_frankie_union_card": True, "open_id_response": sent, "response": union_sent}
+        return {"fallback_operator_card": True, "response": sent}
+    return {"patched_original_card": False}
+
+
+def _handle_company_callback(body):
+    T = tok()
+    ctx = _company_callback_context(body)
+    value = ctx["value"]
+    action = str(value.get("action") or "")
+    if not action.startswith("company_profit_"):
+        return {"ignored": True, "reason": "not_company_profit_action", "action": action}
+
+    run_id = str(value.get("run_id") or "")
+    gap_id = str(value.get("gap_id") or "")
+    idempotency_key = str(value.get("idempotency_key") or _payload_hash(value))
+    if _company_audit_exists(T, idempotency_key):
+        card = _company_processed_card("✅ 公司毛利报表卡片已处理", "系统已处理过这次点击，重复点击没有副作用。",
+                                       details={"action": action, "run_id": run_id, "target": gap_id})
+        return {"duplicate": True, "patch": _patch_or_fallback(ctx, card)}
+
+    before = {"run": (_bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or {}).get("fields", {}),
+              "gap": (_bt_find(T, COMPANY_GAP_TBL, "gap_id", gap_id) or {}).get("fields", {}) if gap_id else {}}
+    ok = True
+    target_type = "run"
+    target_id = run_id
+    result_message = "已处理。"
+
+    if action == "company_profit_gap_resolved":
+        target_type, target_id = "gap", gap_id
+        _company_update_gap(T, gap_id, {"处理结果": "已补件", "是否可进财务终审": "true",
+                                        "来源message_id": ctx["message_id"], "最后动作": action})
+        _company_update_run(T, run_id, {"报表状态": "待AI重跑", "当前阻断方": "AI自动化",
+                                        "P0数量": str(_company_open_p0_count(T, run_id)), "最后动作": action})
+        result_message = "已记录补件，run 状态已改为待 AI 重跑。"
+    elif action == "company_profit_gap_exception":
+        target_type, target_id = "gap", gap_id
+        _company_update_gap(T, gap_id, {"处理结果": "确认例外", "是否可进财务终审": "true",
+                                        "来源message_id": ctx["message_id"], "最后动作": action})
+        open_p0 = _company_open_p0_count(T, run_id)
+        _company_update_run(T, run_id, {"报表状态": "待财务终审" if open_p0 == 0 else "P0待处理",
+                                        "当前阻断方": "财务部" if open_p0 == 0 else "负责人/采购/财务",
+                                        "P0数量": str(open_p0), "最后动作": action})
+        result_message = f"已记录 P0 例外确认；当前未关闭 P0 数={open_p0}。"
+    elif action == "company_profit_finance_approve":
+        open_p0 = _company_open_p0_count(T, run_id)
+        if open_p0 > 0:
+            ok = False
+            result_message = f"拒绝财务通过：仍有 {open_p0} 个未处理 P0。"
+        else:
+            _company_update_run(T, run_id, {"报表状态": "财务通过", "当前阻断方": "AI自动化",
+                                            "总表状态": "待灌总表", "P0数量": "0",
+                                            "最后动作": action})
+            result_message = "财务已通过；run 已进入待灌总表。"
+    elif action == "company_profit_finance_return":
+        _company_update_run(T, run_id, {"报表状态": "P0待处理", "当前阻断方": "财务部",
+                                        "P0数量": str(max(1, _company_open_p0_count(T, run_id))),
+                                        "最后动作": action})
+        result_message = "财务已退回 P0 处理；run 不允许灌总表。"
+    else:
+        ok = False
+        result_message = f"未知 action: {action}"
+
+    after = {"run": (_bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or {}).get("fields", {}),
+             "gap": (_bt_find(T, COMPANY_GAP_TBL, "gap_id", gap_id) or {}).get("fields", {}) if gap_id else {}}
+    _company_write_audit(T, idempotency_key, action, ctx["operator_open_id"], run_id, target_type, target_id,
+                         before, after, {"value": value, "form_value": ctx["form_value"]},
+                         "ok" if ok else "blocked", ctx["message_id"])
+    card = _company_processed_card("✅ 公司毛利报表卡片已处理" if ok else "⚠️ 公司毛利报表卡片未处理",
+                                   result_message, ok=ok,
+                                   details={"action": action, "run_id": run_id, "target": target_id})
+    return {"ok": ok, "action": action, "run_id": run_id, "patch": _patch_or_fallback(ctx, card)}
+
+
+def _last_month():
+    last = datetime.date.today().replace(day=1) - datetime.timedelta(days=1)
+    return last.strftime("%Y-%m")
+
+
 @app.post("/report-monthly")
 async def report_monthly(request: Request):
     if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
         raise HTTPException(401, "unauthorized")
     q = request.query_params
     return _monthly_report(frankie_only=q.get("frankie_only") == "true", dry_run=q.get("dry_run") == "true")
+
+
+@app.post("/profit-workflow/seed")
+async def profit_workflow_seed(request: Request):
+    """Seed company-level gross-profit workflow runs into Finance Base ledger."""
+    if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
+        raise HTTPException(401, "unauthorized")
+    q = request.query_params
+    period = q.get("period") or _last_month()
+    platform = q.get("platform")
+    T = tok()
+    platform_ids = [platform] if platform else list(COMPANY_PLATFORM_REGISTRY.keys())
+    rows = []
+    for pid in platform_ids:
+        rec = _company_seed_run(T, period, pid)
+        rows.append({"platform": pid, "run_id": ft(rec.get("fields", {}).get("run_id")),
+                     "record_id": rec.get("record_id")})
+    return {"period": period, "seeded": rows, "run_table": COMPANY_RUN_TBL}
+
+
+@app.post("/profit-workflow/test-cards")
+async def profit_workflow_test_cards(request: Request):
+    """P0 smoke: create Base ledger rows and optionally send sample cards to Frankie only."""
+    if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
+        raise HTTPException(401, "unauthorized")
+    q = request.query_params
+    period = q.get("period") or _last_month()
+    platform_id = q.get("platform") or "funlabswitch"
+    card_type = q.get("card_type") or "both"  # p0_gap / finance / both
+    send = q.get("send") == "true"
+    T = tok()
+    run = _company_seed_run(T, period, platform_id)
+    rf = run.get("fields", {})
+    run_id = ft(rf.get("run_id"))
+    platform = ft(rf.get("平台"))
+    gap = None
+    cards = {}
+    if card_type in ("p0_gap", "both"):
+        detail = "采购成本缺口阻断，不绕过 5% gate；负责人补成本或 Frankie/财务确认例外后才能进终审。"
+        gap = _company_create_gap(T, run_id, period, platform, "master_data_gap", detail, owner=ft(rf.get("当前阻断方")))
+        _company_update_run(T, run_id, {"报表状态": "P0待处理", "当前阻断方": "采购/负责人",
+                                        "缺口责任类型": "master_data_gap", "P0数量": "1",
+                                        "最后动作": "send_p0_test_card"})
+        run = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or run
+        cards["p0_gap"] = _company_gap_card(run, gap)
+    if card_type in ("finance", "both"):
+        if card_type == "finance":
+            _company_update_run(T, run_id, {"报表状态": "待财务终审", "当前阻断方": "财务部",
+                                            "P0数量": str(_company_open_p0_count(T, run_id)),
+                                            "最后动作": "send_finance_test_card"})
+            run = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or run
+        cards["finance"] = _company_finance_card(run)
+
+    sent = {}
+    if send:
+        ET = event_tok()
+        for name, card in cards.items():
+            res = _send_event_card_union(ET, FRANKIE_UNION_ID, card)
+            mid = (res.get("data") or {}).get("message_id")
+            if mid:
+                _append_company_message_id(T, run_id, mid)
+            sent[name] = {"code": res.get("code"), "message_id": mid}
+    return {"period": period, "platform": platform_id, "run_id": run_id, "frankie_only": True,
+            "send": send, "sent": sent, "cards": cards if not send else list(cards.keys()),
+            "ledger": {"run_table": COMPANY_RUN_TBL, "gap_table": COMPANY_GAP_TBL, "audit_table": COMPANY_AUDIT_TBL}}
+
+
+@app.post("/profit-workflow/callback")
+async def profit_workflow_callback(request: Request):
+    """n8n Event Hub forwards company_profit_* card.action.trigger payloads here."""
+    if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
+        raise HTTPException(401, "unauthorized")
+    body = await request.json()
+    return _handle_company_callback(body)
 
 
 @app.get("/health")
