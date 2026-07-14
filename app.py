@@ -55,6 +55,19 @@ COMPANY_PLATFORM_REGISTRY = {
     "pinduoduo": {"name": "拼多多", "platform": "拼多多", "site": "拼多多店铺组", "data_mode": "manual", "data_status": "待资料提交", "report_status": "待定口径", "blocker_type": "finance_rule_gap", "blocker": "财务/负责人"},
 }
 
+COMPANY_REPORT_FIELD_BY_PLATFORM = {
+    "amazon": "亚马逊毛利报表",
+    "walmart": "沃尔玛毛利报表",
+    "mercadolibre": "美客多毛利报表",
+    "funlab_net": "独立站funlab.net毛利报表",
+    "powkong": "独立站Powkong Admin API毛利报表",
+    "domestic_ecom": "国内电商毛利报表",
+    "funlabswitch": "独立站funlabswitch毛利报表",
+    "aliexpress": "速卖通毛利报表",
+    "tiktok_shop": "TikTok Shop毛利报表",
+    "temu": "TEMU毛利报表",
+}
+
 
 def _tok_for(app_id, app_secret):
     r = requests.post(f"{FEISHU}/auth/v3/tenant_access_token/internal",
@@ -559,6 +572,16 @@ def _company_run_id(period, platform_id):
     return f"company-profit-{period}-{platform_id}"
 
 
+def _company_report_link(T, period, platform_id):
+    if "smoke" in ft(period):
+        return ""
+    field = COMPANY_REPORT_FIELD_BY_PLATFORM.get(platform_id)
+    if not field:
+        return ""
+    ym_slash = ft(period).replace("-", "/")
+    return _idx_links_all(T, ym_slash).get(field) or ""
+
+
 def _company_card_id(card_type, run_id, target_id=""):
     return hashlib.sha1(f"{card_type}:{run_id}:{target_id}".encode("utf-8")).hexdigest()[:12]
 
@@ -590,6 +613,7 @@ def _bt_write(T, tbl, fields, key_field=None):
 def _company_seed_run(T, period, platform_id, *, override=None):
     platform_id, meta = _company_platform(platform_id)
     run_id = _company_run_id(period, platform_id)
+    report_link = _company_report_link(T, period, platform_id)
     fields = {
         "run_id": run_id,
         "期间": period,
@@ -601,6 +625,7 @@ def _company_seed_run(T, period, platform_id, *, override=None):
         "当前阻断方": meta.get("blocker", ""),
         "P0数量": "1" if meta.get("report_status") == "P0待处理" else "0",
         "总表状态": "待灌总表" if meta.get("report_status") == "财务通过" else "未灌",
+        "报表链接": report_link,
         "最后动作": "seed_run",
         "最后动作时间": str(_now_ms()),
         "payload_json": _compact_json({"platform_id": platform_id, "meta": meta}),
@@ -989,6 +1014,10 @@ def _company_button(text, payload, button_type="default"):
     return {"tag": "button", "text": {"tag": "plain_text", "content": text}, "type": button_type, "value": payload}
 
 
+def _company_link_button(text, url):
+    return {"tag": "button", "text": {"tag": "plain_text", "content": text}, "type": "default", "url": url}
+
+
 def _company_base_card(title, template, elements):
     return {"config": {"wide_screen_mode": True},
             "header": {"template": template, "title": {"tag": "plain_text", "content": title}},
@@ -1132,13 +1161,14 @@ def _company_finance_card(run, *, test_mode=False, test_note=None):
     rf = run.get("fields", {})
     run_id = ft(rf.get("run_id"))
     period = ft(rf.get("期间"))
+    report_link = ft(rf.get("报表链接"))
     ident = _company_meta_from_run(rf)
     platform = ident["channel"]
     site = ident["site"]
     card_id = _company_card_id("finance_confirm", run_id, platform)
     nonce = str(_now_ms())
     note = (test_note or "测试卡，仅发给 Frankie；不会通知财务。") if test_mode else "请确认后再点击，处理结果会自动更新在这张卡片上。"
-    return _company_base_card("🟡 [FIN·P2] 毛利报表终审", "orange", [
+    elements = [
         _company_fields([
             ("渠道", platform),
             ("站点/店铺", site),
@@ -1151,6 +1181,15 @@ def _company_finance_card(run, *, test_mode=False, test_note=None):
             "如果还有成本、物流或口径问题没处理完，系统会自动拦住，不会进入公司总毛利表。"
         ),
         {"tag": "hr"},
+    ]
+    if report_link:
+        elements.append({"tag": "action", "actions": [_company_link_button("打开毛利报表", report_link)]})
+        elements.append({"tag": "hr"})
+    else:
+        link_msg = "测试卡未绑定真实毛利报表链接，当前只验证收件、按钮和写回。" if test_mode else "当前卡片还没有绑定毛利报表链接，请先补链接后再确认。"
+        elements.append(_company_md(link_msg))
+        elements.append({"tag": "hr"})
+    elements += [
         {"tag": "action", "actions": [
             _company_button("终审通过",
                             _company_payload("company_profit_finance_approve", run_id, "finance_confirm", card_id,
@@ -1161,7 +1200,8 @@ def _company_finance_card(run, *, test_mode=False, test_note=None):
                                              platform=platform, period=period, decision="return_p0", nonce=nonce)),
         ]},
         _company_note(note),
-    ])
+    ]
+    return _company_base_card("🟡 [FIN·P2] 毛利报表终审", "orange", elements)
 
 
 def _company_finance_card_recipients(T, mode):
@@ -1332,11 +1372,15 @@ def _handle_company_callback(body):
         result_message = "已记录：本月先按例外处理。系统会检查是否还有其他未处理问题。"
     elif action == "company_profit_finance_approve":
         open_p0 = _company_open_p0_count(T, run_id)
+        before_run = before.get("run") or {}
         if open_p0 > 0:
             ok = False
             result_message = f"还有 {open_p0} 个关键问题没处理完，这次不能确认通过。"
+        elif not _company_is_smoke_run(before_run, run_id) and not ft(before_run.get("报表链接")):
+            ok = False
+            result_message = "这张终审卡还没有绑定毛利报表链接，不能确认通过。"
         else:
-            update_fields, result_message = _company_mark_finance_approved(T, run_id, before.get("run") or {})
+            update_fields, result_message = _company_mark_finance_approved(T, run_id, before_run)
             _company_update_run(T, run_id, update_fields)
     elif action == "company_profit_finance_return":
         _company_update_run(T, run_id, {"报表状态": "P0待处理", "当前阻断方": "财务部",
