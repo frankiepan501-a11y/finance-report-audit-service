@@ -37,20 +37,20 @@ COMPANY_AUDIT_TBL = os.environ.get("COMPANY_PROFIT_AUDIT_TABLE_ID", "tblVan2P6bs
 COMPANY_CARD_SCHEMA = "company_profit_card_v1"
 
 COMPANY_PLATFORM_REGISTRY = {
-    "amazon": {"name": "Amazon", "platform": "亚马逊", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部"},
-    "walmart": {"name": "Walmart", "platform": "沃尔玛", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部"},
-    "mercadolibre": {"name": "Mercado Libre", "platform": "美客多", "data_mode": "hybrid", "data_status": "数据已就绪", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部"},
-    "funlab_net": {"name": "funlab.net", "platform": "funlab.net", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部"},
-    "powkong": {"name": "Powkong", "platform": "Powkong", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部"},
-    "domestic_ecom": {"name": "国内电商", "platform": "国内电商", "data_mode": "manual", "data_status": "资料已提交", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部"},
-    "funlabswitch": {"name": "funlabswitch", "platform": "funlabswitch", "data_mode": "hybrid", "data_status": "待成本物流维护", "report_status": "P0待处理", "blocker_type": "master_data_gap", "blocker": "采购/负责人"},
-    "aliexpress": {"name": "AliExpress", "platform": "速卖通", "data_mode": "api", "data_status": "取数完成", "report_status": "待接统一终审", "blocker_type": "workflow_gap", "blocker": "AI自动化"},
-    "tiktok_shop": {"name": "TikTok Shop", "platform": "TikTok Shop", "data_mode": "api", "data_status": "取数完成", "report_status": "待接统一终审", "blocker_type": "workflow_gap", "blocker": "AI自动化"},
-    "b2b": {"name": "B2B", "platform": "B2B", "data_mode": "ledger", "data_status": "台账已就绪", "report_status": "待接台账模式", "blocker_type": "workflow_gap", "blocker": "AI自动化"},
-    "offline": {"name": "国内线下", "platform": "国内线下", "data_mode": "ledger", "data_status": "台账已就绪", "report_status": "待接台账模式", "blocker_type": "workflow_gap", "blocker": "AI自动化"},
-    "temu": {"name": "TEMU", "platform": "TEMU", "data_mode": "manual", "data_status": "待资料提交", "report_status": "待定口径", "blocker_type": "finance_rule_gap", "blocker": "财务/负责人"},
-    "taobao": {"name": "淘宝", "platform": "淘宝", "data_mode": "manual", "data_status": "待资料提交", "report_status": "待定口径", "blocker_type": "finance_rule_gap", "blocker": "财务/负责人"},
-    "pinduoduo": {"name": "拼多多", "platform": "拼多多", "data_mode": "manual", "data_status": "待资料提交", "report_status": "待定口径", "blocker_type": "finance_rule_gap", "blocker": "财务/负责人"},
+    "amazon": {"name": "Amazon", "platform": "亚马逊", "site": "亚马逊全站", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部"},
+    "walmart": {"name": "Walmart", "platform": "沃尔玛", "site": "沃尔玛全站", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部"},
+    "mercadolibre": {"name": "Mercado Libre", "platform": "美客多", "site": "美客多店铺组", "data_mode": "hybrid", "data_status": "数据已就绪", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部"},
+    "funlab_net": {"name": "funlab.net", "platform": "独立站", "site": "funlab.net", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部"},
+    "powkong": {"name": "Powkong", "platform": "独立站", "site": "powkong.com", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部"},
+    "domestic_ecom": {"name": "国内电商", "platform": "国内电商", "site": "国内电商店铺组", "data_mode": "manual", "data_status": "资料已提交", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部"},
+    "funlabswitch": {"name": "funlabswitch.com", "platform": "独立站", "site": "funlabswitch.com", "data_mode": "hybrid", "data_status": "待成本维护", "report_status": "P0待处理", "blocker_type": "master_data_gap", "blocker": "采购/负责人"},
+    "aliexpress": {"name": "AliExpress", "platform": "速卖通", "site": "速卖通店铺组", "data_mode": "api", "data_status": "取数完成", "report_status": "待接统一终审", "blocker_type": "workflow_gap", "blocker": "AI自动化"},
+    "tiktok_shop": {"name": "TikTok Shop", "platform": "TikTok Shop", "site": "TikTok Shop店铺组", "data_mode": "api", "data_status": "取数完成", "report_status": "待接统一终审", "blocker_type": "workflow_gap", "blocker": "AI自动化"},
+    "b2b": {"name": "B2B", "platform": "B2B", "site": "B2B业务台账", "data_mode": "ledger", "data_status": "台账已就绪", "report_status": "待接台账模式", "blocker_type": "workflow_gap", "blocker": "AI自动化"},
+    "offline": {"name": "国内线下", "platform": "国内线下", "site": "国内线下业务台账", "data_mode": "ledger", "data_status": "台账已就绪", "report_status": "待接台账模式", "blocker_type": "workflow_gap", "blocker": "AI自动化"},
+    "temu": {"name": "TEMU", "platform": "TEMU", "site": "TEMU店铺组", "data_mode": "manual", "data_status": "待资料提交", "report_status": "待定口径", "blocker_type": "finance_rule_gap", "blocker": "财务/负责人"},
+    "taobao": {"name": "淘宝", "platform": "淘宝", "site": "淘宝店铺组", "data_mode": "manual", "data_status": "待资料提交", "report_status": "待定口径", "blocker_type": "finance_rule_gap", "blocker": "财务/负责人"},
+    "pinduoduo": {"name": "拼多多", "platform": "拼多多", "site": "拼多多店铺组", "data_mode": "manual", "data_status": "待资料提交", "report_status": "待定口径", "blocker_type": "finance_rule_gap", "blocker": "财务/负责人"},
 }
 
 
@@ -1012,6 +1012,26 @@ def _company_period_label(period):
     return p or "-"
 
 
+def _company_meta_from_run(fields):
+    try:
+        payload = json.loads(ft(fields.get("payload_json")) or "{}")
+        meta = payload.get("meta") or {}
+    except Exception:
+        meta = {}
+    channel = ft(fields.get("平台"))
+    site = ft(meta.get("site")) or ft(meta.get("name"))
+    if channel in ("funlabswitch", "funlab.net", "Powkong", "powkong"):
+        site_map = {
+            "funlabswitch": "funlabswitch.com",
+            "funlab.net": "funlab.net",
+            "Powkong": "powkong.com",
+            "powkong": "powkong.com",
+        }
+        site = site_map.get(channel, site)
+        channel = "独立站"
+    return {"channel": channel or "-", "site": site or "-"}
+
+
 def _company_processed_card(title, message, ok=True, details=None):
     details = details or {}
     elements = [_company_md(message)]
@@ -1028,7 +1048,9 @@ def _company_gap_card(run, gap, *, test_mode=False):
     run_id = ft(rf.get("run_id"))
     gap_id = ft(gf.get("gap_id"))
     period = ft(rf.get("期间")) or ft(gf.get("期间"))
-    platform = ft(rf.get("平台")) or ft(gf.get("平台"))
+    ident = _company_meta_from_run(rf)
+    platform = ident["channel"]
+    site = ident["site"]
     gap_type = ft(gf.get("缺口责任类型")) or ft(rf.get("缺口责任类型"))
     detail = ft(gf.get("缺口说明")) or ft(gf.get("证据"))
     blocker = ft(rf.get("当前阻断方")) or ft(gf.get("责任人")) or "-"
@@ -1037,15 +1059,15 @@ def _company_gap_card(run, gap, *, test_mode=False):
     note = "测试卡，仅发给 Frankie；不会通知运营或财务。" if test_mode else "请确认后再点击，处理结果会自动更新在这张卡片上。"
     return _company_base_card("🔴 [FIN·P0] 毛利缺口待处理", "red", [
         _company_fields([
-            ("平台", platform),
-            ("期间", _company_period_label(period)),
-            ("阻断方", blocker),
-            ("缺口类型", _company_label(GAP_TYPE_LABELS, gap_type)),
+            ("渠道", platform),
+            ("站点/店铺", site),
+            ("月份", _company_period_label(period)),
+            ("需要处理的人", blocker),
         ]),
         {"tag": "hr"},
         _company_md(
-            f"**缺口说明**\n{detail or '待补充'}\n\n"
-            "P0 关闭前不能进入财务终审，也不能灌总表。"
+            f"**现在卡在哪里？**\n{detail or '有商品成本还没补齐，毛利会算不准。'}\n\n"
+            "成本问题处理前，这份报表不会交给财务做最终确认，也不会写入公司总毛利表。"
         ),
         {"tag": "hr"},
         {"tag": "action", "actions": [
@@ -1053,7 +1075,7 @@ def _company_gap_card(run, gap, *, test_mode=False):
                             _company_payload("company_profit_gap_resolved", run_id, "p0_gap", card_id,
                                              gap_id=gap_id, platform=platform, period=period, nonce=nonce),
                             "primary"),
-            _company_button("本月例外终审",
+            _company_button("本月先按例外处理",
                             _company_payload("company_profit_gap_exception", run_id, "p0_gap", card_id,
                                              gap_id=gap_id, platform=platform, period=period,
                                              decision="exception", nonce=nonce)),
@@ -1066,23 +1088,23 @@ def _company_finance_card(run, *, test_mode=False):
     rf = run.get("fields", {})
     run_id = ft(rf.get("run_id"))
     period = ft(rf.get("期间"))
-    platform = ft(rf.get("平台"))
+    ident = _company_meta_from_run(rf)
+    platform = ident["channel"]
+    site = ident["site"]
     card_id = _company_card_id("finance_confirm", run_id, platform)
     nonce = str(_now_ms())
     note = "测试卡，仅发给 Frankie；不会通知财务。" if test_mode else "请确认后再点击，处理结果会自动更新在这张卡片上。"
     return _company_base_card("🟡 [FIN·P2] 毛利报表终审", "orange", [
         _company_fields([
-            ("平台", platform),
-            ("期间", _company_period_label(period)),
-            ("数据方式", _company_label(DATA_MODE_LABELS, rf.get("data_mode"))),
-            ("数据状态", ft(rf.get("数据状态"))),
-            ("报表状态", ft(rf.get("报表状态"))),
-            ("总表状态", ft(rf.get("总表状态")) or "未灌总表"),
+            ("渠道", platform),
+            ("站点/店铺", site),
+            ("月份", _company_period_label(period)),
+            ("目前状态", ft(rf.get("报表状态"))),
         ]),
         {"tag": "hr"},
         _company_md(
-            "请确认本月毛利报表是否可以终审通过。\n\n"
-            "提交时系统会再次检查 P0；仍有未处理缺口时会自动拒绝通过。"
+            "请财务确认：这份毛利报表是否可以作为本月最终版本。\n\n"
+            "如果还有成本、物流或口径问题没处理完，系统会自动拦住，不会进入公司总毛利表。"
         ),
         {"tag": "hr"},
         {"tag": "action", "actions": [
@@ -1216,9 +1238,11 @@ def _handle_company_callback(body):
     if _company_audit_exists(T, idempotency_key):
         current_run = (_bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or {}).get("fields", {})
         current_gap = (_bt_find(T, COMPANY_GAP_TBL, "gap_id", gap_id) or {}).get("fields", {}) if gap_id else {}
+        current_ident = _company_meta_from_run(current_run)
         card = _company_processed_card("✅ 毛利卡片已处理", "这次点击已经记录过，重复点击不会再次改变状态。",
-                                       details={"平台": ft(current_run.get("平台")),
-                                                "期间": _company_period_label(current_run.get("期间")),
+                                       details={"渠道": current_ident["channel"],
+                                                "站点/店铺": current_ident["site"],
+                                                "月份": _company_period_label(current_run.get("期间")),
                                                 "当前状态": ft(current_run.get("报表状态")),
                                                 "缺口状态": ft(current_gap.get("处理结果"))})
         return {"duplicate": True, "patch": _patch_or_fallback(ctx, card)}
@@ -1236,7 +1260,7 @@ def _handle_company_callback(body):
                                         "来源message_id": ctx["message_id"], "最后动作": action})
         _company_update_run(T, run_id, {"报表状态": "待AI重跑", "当前阻断方": "AI自动化",
                                         "P0数量": str(_company_open_p0_count(T, run_id)), "最后动作": action})
-        result_message = "已记录补件，报表将进入 AI 重跑。"
+        result_message = "已记录：成本已补齐。系统会重新生成这份毛利报表。"
     elif action == "company_profit_gap_exception":
         target_type, target_id = "gap", gap_id
         _company_update_gap(T, gap_id, {"处理结果": "确认例外", "是否可进财务终审": "true",
@@ -1245,22 +1269,22 @@ def _handle_company_callback(body):
         _company_update_run(T, run_id, {"报表状态": "待财务终审" if open_p0 == 0 else "P0待处理",
                                         "当前阻断方": "财务部" if open_p0 == 0 else "负责人/采购/财务",
                                         "P0数量": str(open_p0), "最后动作": action})
-        result_message = "已记录本月例外，系统会按剩余缺口判断是否进入财务终审。"
+        result_message = "已记录：本月先按例外处理。系统会检查是否还有其他未处理问题。"
     elif action == "company_profit_finance_approve":
         open_p0 = _company_open_p0_count(T, run_id)
         if open_p0 > 0:
             ok = False
-            result_message = f"仍有 {open_p0} 个 P0 缺口未处理，本次不能终审通过。"
+            result_message = f"还有 {open_p0} 个关键问题没处理完，这次不能确认通过。"
         else:
             _company_update_run(T, run_id, {"报表状态": "财务通过", "当前阻断方": "AI自动化",
                                             "总表状态": "待灌总表", "P0数量": "0",
                                             "最后动作": action})
-            result_message = "财务终审已通过，下一步进入总表灌表队列。"
+            result_message = "财务已确认通过，下一步会写入公司总毛利表。"
     elif action == "company_profit_finance_return":
         _company_update_run(T, run_id, {"报表状态": "P0待处理", "当前阻断方": "财务部",
                                         "P0数量": str(max(1, _company_open_p0_count(T, run_id))),
                                         "最后动作": action})
-        result_message = "已退回补缺口，暂不能进入总表灌表。"
+        result_message = "已退回处理问题，暂时不会写入公司总毛利表。"
     else:
         ok = False
         result_message = "这张卡片的按钮动作无法识别，请联系 AI 自动化处理。"
@@ -1272,9 +1296,11 @@ def _handle_company_callback(body):
                          "ok" if ok else "blocked", ctx["message_id"])
     after_run = after.get("run") or {}
     after_gap = after.get("gap") or {}
+    after_ident = _company_meta_from_run(after_run)
     result_details = {
-        "平台": ft(after_run.get("平台")),
-        "期间": _company_period_label(after_run.get("期间")),
+        "渠道": after_ident["channel"],
+        "站点/店铺": after_ident["site"],
+        "月份": _company_period_label(after_run.get("期间")),
         "当前状态": ft(after_run.get("报表状态")),
         "缺口状态": ft(after_gap.get("处理结果")) if after_gap else "",
         "剩余P0": ft(after_run.get("P0数量")),
@@ -1333,7 +1359,7 @@ async def profit_workflow_test_cards(request: Request):
     gap = None
     cards = {}
     if card_type in ("p0_gap", "both"):
-        detail = "采购成本缺口阻断，不绕过 5% gate；负责人补成本或 Frankie/财务确认例外后才能进终审。"
+        detail = "这份报表里有商品还没有采购成本。成本没补齐时，毛利会算不准。请先补齐成本；如果确认本月可以临时按例外处理，再点“本月先按例外处理”。"
         gap = _company_create_gap(T, run_id, period, platform, "master_data_gap", detail, owner=ft(rf.get("当前阻断方")))
         _company_update_run(T, run_id, {"报表状态": "P0待处理", "当前阻断方": "采购/负责人",
                                         "缺口责任类型": "master_data_gap", "P0数量": "1",
