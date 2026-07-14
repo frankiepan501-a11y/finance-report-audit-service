@@ -951,6 +951,15 @@ def _company_md(text):
     return {"tag": "div", "text": {"tag": "lark_md", "content": text}}
 
 
+def _company_fields(items):
+    fields = []
+    for label, value in items:
+        if value is None or value == "":
+            value = "-"
+        fields.append({"is_short": True, "text": {"tag": "lark_md", "content": f"**{label}**\n{value}"}})
+    return {"tag": "div", "fields": fields}
+
+
 def _company_note(text):
     return {"tag": "note", "elements": [{"tag": "plain_text", "content": text}]}
 
@@ -974,15 +983,46 @@ def _company_payload(action, run_id, card_type, card_id, *, gap_id="", platform=
             "idempotency_key": _company_idem(action, run_id, card_id, target_id, nonce)}
 
 
+GAP_TYPE_LABELS = {
+    "api_error": "自动取数异常",
+    "source_file_gap": "平台报表资料缺口",
+    "master_data_gap": "采购/成本/物流资料缺口",
+    "finance_rule_gap": "财务口径待确认",
+    "zero_report_confirm": "零销售确认",
+    "workflow_gap": "流程接入缺口",
+}
+
+DATA_MODE_LABELS = {
+    "api": "自动取数",
+    "manual": "人工资料",
+    "hybrid": "自动同步 + 成本物流维护",
+    "ledger": "业务台账",
+}
+
+
+def _company_label(mapping, value):
+    raw = ft(value)
+    return mapping.get(raw, raw or "-")
+
+
+def _company_period_label(period):
+    p = ft(period)
+    if "smoke" in p:
+        return "测试账期"
+    return p or "-"
+
+
 def _company_processed_card(title, message, ok=True, details=None):
     details = details or {}
-    extra = "\n\n" + "\n".join(f"- {k}: {v}" for k, v in details.items() if v) if details else ""
-    return _company_base_card(title, "green" if ok else "grey", [
-        _company_md(f"{message}{extra}\n\n此卡片已处理；重复点击不会重复写 Base。")
-    ])
+    elements = [_company_md(message)]
+    visible = [(k, v) for k, v in details.items() if v]
+    if visible:
+        elements += [{"tag": "hr"}, _company_fields(visible)]
+    elements.append(_company_note("此卡片已处理，无需重复点击。"))
+    return _company_base_card(title, "green" if ok else "grey", elements)
 
 
-def _company_gap_card(run, gap):
+def _company_gap_card(run, gap, *, test_mode=False):
     rf = run.get("fields", {})
     gf = gap.get("fields", {})
     run_id = ft(rf.get("run_id"))
@@ -991,62 +1031,70 @@ def _company_gap_card(run, gap):
     platform = ft(rf.get("平台")) or ft(gf.get("平台"))
     gap_type = ft(gf.get("缺口责任类型")) or ft(rf.get("缺口责任类型"))
     detail = ft(gf.get("缺口说明")) or ft(gf.get("证据"))
+    blocker = ft(rf.get("当前阻断方")) or ft(gf.get("责任人")) or "-"
     card_id = _company_card_id("p0_gap", run_id, gap_id)
     nonce = str(_now_ms())
-    return _company_base_card(f"🔴 [FIN·P0] 公司毛利报表缺口 · {platform} {period}", "red", [
+    note = "测试卡，仅发给 Frankie；不会通知运营或财务。" if test_mode else "请确认后再点击，处理结果会自动更新在这张卡片上。"
+    return _company_base_card("🔴 [FIN·P0] 毛利缺口待处理", "red", [
+        _company_fields([
+            ("平台", platform),
+            ("期间", _company_period_label(period)),
+            ("阻断方", blocker),
+            ("缺口类型", _company_label(GAP_TYPE_LABELS, gap_type)),
+        ]),
+        {"tag": "hr"},
         _company_md(
-            f"**run_id**：{run_id}\n"
-            f"**gap_id**：{gap_id}\n"
-            f"**平台**：{platform}\n"
-            f"**期间**：{period}\n"
-            f"**缺口责任类型**：{gap_type}\n"
-            f"**当前阻断方**：{ft(rf.get('当前阻断方')) or ft(gf.get('责任人')) or '-'}\n\n"
             f"**缺口说明**\n{detail or '待补充'}\n\n"
             "P0 关闭前不能进入财务终审，也不能灌总表。"
         ),
         {"tag": "hr"},
         {"tag": "action", "actions": [
-            _company_button("已补件，待AI重跑",
+            _company_button("成本已补齐",
                             _company_payload("company_profit_gap_resolved", run_id, "p0_gap", card_id,
                                              gap_id=gap_id, platform=platform, period=period, nonce=nonce),
                             "primary"),
-            _company_button("确认例外，转财务终审",
+            _company_button("本月例外终审",
                             _company_payload("company_profit_gap_exception", run_id, "p0_gap", card_id,
                                              gap_id=gap_id, platform=platform, period=period,
                                              decision="exception", nonce=nonce)),
         ]},
-        _company_note("Frankie-only P0 测试卡：按钮只写 Base ledger 和 PATCH 原卡，不触达运营/财务。"),
+        _company_note(note),
     ])
 
 
-def _company_finance_card(run):
+def _company_finance_card(run, *, test_mode=False):
     rf = run.get("fields", {})
     run_id = ft(rf.get("run_id"))
     period = ft(rf.get("期间"))
     platform = ft(rf.get("平台"))
     card_id = _company_card_id("finance_confirm", run_id, platform)
     nonce = str(_now_ms())
-    return _company_base_card(f"🟡 [FIN·P2] 公司毛利报表财务终审 · {platform} {period}", "orange", [
+    note = "测试卡，仅发给 Frankie；不会通知财务。" if test_mode else "请确认后再点击，处理结果会自动更新在这张卡片上。"
+    return _company_base_card("🟡 [FIN·P2] 毛利报表终审", "orange", [
+        _company_fields([
+            ("平台", platform),
+            ("期间", _company_period_label(period)),
+            ("数据方式", _company_label(DATA_MODE_LABELS, rf.get("data_mode"))),
+            ("数据状态", ft(rf.get("数据状态"))),
+            ("报表状态", ft(rf.get("报表状态"))),
+            ("总表状态", ft(rf.get("总表状态")) or "未灌总表"),
+        ]),
+        {"tag": "hr"},
         _company_md(
-            f"**run_id**：{run_id}\n"
-            f"**平台**：{platform}\n"
-            f"**data_mode**：{ft(rf.get('data_mode'))}\n"
-            f"**数据状态**：{ft(rf.get('数据状态'))}\n"
-            f"**报表状态**：{ft(rf.get('报表状态'))}\n"
-            f"**总表状态**：{ft(rf.get('总表状态')) or '未灌'}\n\n"
-            "服务端会再次检查 P0：只允许 `P0=0` 或 `P0已确认例外` 的 run 通过终审。"
+            "请确认本月毛利报表是否可以终审通过。\n\n"
+            "提交时系统会再次检查 P0；仍有未处理缺口时会自动拒绝通过。"
         ),
         {"tag": "hr"},
         {"tag": "action", "actions": [
-            _company_button("财务通过",
+            _company_button("终审通过",
                             _company_payload("company_profit_finance_approve", run_id, "finance_confirm", card_id,
                                              platform=platform, period=period, decision="approve", nonce=nonce),
                             "primary"),
-            _company_button("退回P0处理",
+            _company_button("退回补缺口",
                             _company_payload("company_profit_finance_return", run_id, "finance_confirm", card_id,
                                              platform=platform, period=period, decision="return_p0", nonce=nonce)),
         ]},
-        _company_note("财务通过只推进 ledger 状态；总表仍由 /aggregate 或各平台自灌服务按 gate 写入。"),
+        _company_note(note),
     ])
 
 
@@ -1166,8 +1214,13 @@ def _handle_company_callback(body):
     gap_id = str(value.get("gap_id") or "")
     idempotency_key = str(value.get("idempotency_key") or _payload_hash(value))
     if _company_audit_exists(T, idempotency_key):
-        card = _company_processed_card("✅ 公司毛利报表卡片已处理", "系统已处理过这次点击，重复点击没有副作用。",
-                                       details={"action": action, "run_id": run_id, "target": gap_id})
+        current_run = (_bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or {}).get("fields", {})
+        current_gap = (_bt_find(T, COMPANY_GAP_TBL, "gap_id", gap_id) or {}).get("fields", {}) if gap_id else {}
+        card = _company_processed_card("✅ 毛利卡片已处理", "这次点击已经记录过，重复点击不会再次改变状态。",
+                                       details={"平台": ft(current_run.get("平台")),
+                                                "期间": _company_period_label(current_run.get("期间")),
+                                                "当前状态": ft(current_run.get("报表状态")),
+                                                "缺口状态": ft(current_gap.get("处理结果"))})
         return {"duplicate": True, "patch": _patch_or_fallback(ctx, card)}
 
     before = {"run": (_bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or {}).get("fields", {}),
@@ -1183,7 +1236,7 @@ def _handle_company_callback(body):
                                         "来源message_id": ctx["message_id"], "最后动作": action})
         _company_update_run(T, run_id, {"报表状态": "待AI重跑", "当前阻断方": "AI自动化",
                                         "P0数量": str(_company_open_p0_count(T, run_id)), "最后动作": action})
-        result_message = "已记录补件，run 状态已改为待 AI 重跑。"
+        result_message = "已记录补件，报表将进入 AI 重跑。"
     elif action == "company_profit_gap_exception":
         target_type, target_id = "gap", gap_id
         _company_update_gap(T, gap_id, {"处理结果": "确认例外", "是否可进财务终审": "true",
@@ -1192,34 +1245,42 @@ def _handle_company_callback(body):
         _company_update_run(T, run_id, {"报表状态": "待财务终审" if open_p0 == 0 else "P0待处理",
                                         "当前阻断方": "财务部" if open_p0 == 0 else "负责人/采购/财务",
                                         "P0数量": str(open_p0), "最后动作": action})
-        result_message = f"已记录 P0 例外确认；当前未关闭 P0 数={open_p0}。"
+        result_message = "已记录本月例外，系统会按剩余缺口判断是否进入财务终审。"
     elif action == "company_profit_finance_approve":
         open_p0 = _company_open_p0_count(T, run_id)
         if open_p0 > 0:
             ok = False
-            result_message = f"拒绝财务通过：仍有 {open_p0} 个未处理 P0。"
+            result_message = f"仍有 {open_p0} 个 P0 缺口未处理，本次不能终审通过。"
         else:
             _company_update_run(T, run_id, {"报表状态": "财务通过", "当前阻断方": "AI自动化",
                                             "总表状态": "待灌总表", "P0数量": "0",
                                             "最后动作": action})
-            result_message = "财务已通过；run 已进入待灌总表。"
+            result_message = "财务终审已通过，下一步进入总表灌表队列。"
     elif action == "company_profit_finance_return":
         _company_update_run(T, run_id, {"报表状态": "P0待处理", "当前阻断方": "财务部",
                                         "P0数量": str(max(1, _company_open_p0_count(T, run_id))),
                                         "最后动作": action})
-        result_message = "财务已退回 P0 处理；run 不允许灌总表。"
+        result_message = "已退回补缺口，暂不能进入总表灌表。"
     else:
         ok = False
-        result_message = f"未知 action: {action}"
+        result_message = "这张卡片的按钮动作无法识别，请联系 AI 自动化处理。"
 
     after = {"run": (_bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or {}).get("fields", {}),
              "gap": (_bt_find(T, COMPANY_GAP_TBL, "gap_id", gap_id) or {}).get("fields", {}) if gap_id else {}}
     _company_write_audit(T, idempotency_key, action, ctx["operator_open_id"], run_id, target_type, target_id,
                          before, after, {"value": value, "form_value": ctx["form_value"]},
                          "ok" if ok else "blocked", ctx["message_id"])
-    card = _company_processed_card("✅ 公司毛利报表卡片已处理" if ok else "⚠️ 公司毛利报表卡片未处理",
-                                   result_message, ok=ok,
-                                   details={"action": action, "run_id": run_id, "target": target_id})
+    after_run = after.get("run") or {}
+    after_gap = after.get("gap") or {}
+    result_details = {
+        "平台": ft(after_run.get("平台")),
+        "期间": _company_period_label(after_run.get("期间")),
+        "当前状态": ft(after_run.get("报表状态")),
+        "缺口状态": ft(after_gap.get("处理结果")) if after_gap else "",
+        "剩余P0": ft(after_run.get("P0数量")),
+    }
+    card = _company_processed_card("✅ 毛利卡片已处理" if ok else "⚠️ 毛利卡片未通过",
+                                   result_message, ok=ok, details=result_details)
     return {"ok": ok, "action": action, "run_id": run_id, "patch": _patch_or_fallback(ctx, card)}
 
 
@@ -1278,14 +1339,14 @@ async def profit_workflow_test_cards(request: Request):
                                         "缺口责任类型": "master_data_gap", "P0数量": "1",
                                         "最后动作": "send_p0_test_card"})
         run = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or run
-        cards["p0_gap"] = _company_gap_card(run, gap)
+        cards["p0_gap"] = _company_gap_card(run, gap, test_mode=True)
     if card_type in ("finance", "both"):
         if card_type == "finance":
             _company_update_run(T, run_id, {"报表状态": "待财务终审", "当前阻断方": "财务部",
                                             "P0数量": str(_company_open_p0_count(T, run_id)),
                                             "最后动作": "send_finance_test_card"})
             run = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or run
-        cards["finance"] = _company_finance_card(run)
+        cards["finance"] = _company_finance_card(run, test_mode=True)
 
     sent = {}
     if send:
