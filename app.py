@@ -520,9 +520,9 @@ def _agg_ecom(T, ss):
     vals, title = _sheet_vals(T, ss, prefer="毛利结果")
     if not vals: return None
     hdr = vals[0]; rows = vals[1:]
-    c = dict(sales=colexact(hdr, "销售额"), margin=colexact(hdr, "毛利额"), pf=colexact(hdr, "平台费合计"),
+    c = dict(sales=colexact(hdr, "销售额") or colidx(hdr, "销售额"), margin=colexact(hdr, "毛利额"), pf=colexact(hdr, "平台费合计"),
              ad=colexact(hdr, "推广/广告费"), cost=colidx(hdr, "采购成本"), freight=colexact(hdr, "物流成本"),
-             qty=colexact(hdr, "销量"), rq=colexact(hdr, "退款数量"),
+             qty=colexact(hdr, "销量"), rq=colexact(hdr, "退款数量") or colidx(hdr, "退款数量"),
              netqty=colexact(hdr, "净销量"), netsales=colexact(hdr, "净销售额"))
     a = dict(sales=0, margin=0, payback=0, cost=0, freight=0, ad=0, pf=0, qty=0, rq=0, cm_n=0, cm_amt=0)
     def g(row, i): return _aggnum(row[i]) if (i is not None and i < len(row)) else 0
