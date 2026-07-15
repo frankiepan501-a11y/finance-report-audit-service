@@ -1149,6 +1149,62 @@ def _company_sheet_row_count(T, token, ptype):
         return None
 
 
+def _company_cost_gap_details_from_sheet(T, token, ptype, limit=30):
+    if not token:
+        return []
+    prefer = "毛利结果" if ptype == "ecom" else None
+    vals, _ = _sheet_vals(T, token, prefer=prefer)
+    if not vals:
+        return []
+    hdr = vals[0]
+    rows = vals[1:]
+    c = {
+        "owner": colidx(hdr, "Listing负责人") or colidx(hdr, "负责人"),
+        "shop": colexact(hdr, "店铺") or colidx(hdr, "店铺"),
+        "msku": colidx(hdr, "MSKU") or colexact(hdr, "SKU") or colidx(hdr, "SKU"),
+        "name": colidx(hdr, "中文名称") or colidx(hdr, "商品名称") or colidx(hdr, "品名"),
+        "qty": colexact(hdr, "销量") or colidx(hdr, "销量"),
+        "sales": colidx(hdr, "售价", "RMB") or colidx(hdr, "销售额", "RMB") or colidx(hdr, "净销售额"),
+        "cost": colidx(hdr, "采购成本", "RMB") or colidx(hdr, "采购成本"),
+        "freight": colidx(hdr, "头程", "RMB") or colidx(hdr, "物流成本"),
+        "margin": colidx(hdr, "毛利润", "RMB") or colidx(hdr, "毛利额"),
+        "netqty": colidx(hdr, "净销量"),
+        "netsales": colidx(hdr, "净销售额"),
+    }
+
+    def g(row, key):
+        i = c.get(key)
+        return _aggnum(row[i]) if (i is not None and i < len(row)) else 0
+
+    def txt(row, key):
+        i = c.get(key)
+        return ft(row[i]) if (i is not None and i < len(row)) else ""
+
+    details = []
+    for idx, row in enumerate(rows, start=2):
+        sales = g(row, "sales")
+        if ptype == "ecom" and c.get("netqty") is not None:
+            sales = g(row, "netsales") or sales
+            is_gap = g(row, "netqty") > 0 and g(row, "cost") == 0
+        else:
+            is_gap = sales > 0 and g(row, "cost") == 0
+        if not is_gap:
+            continue
+        details.append({
+            "row": idx,
+            "shop": txt(row, "shop"),
+            "msku": txt(row, "msku"),
+            "name": txt(row, "name"),
+            "owner": txt(row, "owner"),
+            "qty": round(g(row, "qty")),
+            "sales_rmb": round(sales, 2),
+            "purchase_cost_rmb": round(g(row, "cost"), 2),
+            "freight_rmb": round(g(row, "freight"), 2),
+            "margin_rmb": round(g(row, "margin"), 2),
+        })
+    return sorted(details, key=lambda x: -x["sales_rmb"])[:limit]
+
+
 def _company_report_summary(T, fields):
     report_link = ft(fields.get("报表链接"))
     token, typ = _parse_link(report_link)
@@ -1182,7 +1238,8 @@ def _company_report_summary(T, fields):
         a = dict(a)
         a["gross_margin"] = (a.get("margin", 0) / a.get("sales", 0)) if a.get("sales") else 0
         result.update({"ok": True, "summary": a, "field": fld, "shop": shop,
-                       "rows": _company_sheet_row_count(T, token, ptype)})
+                       "rows": _company_sheet_row_count(T, token, ptype),
+                       "gap_details": _company_cost_gap_details_from_sheet(T, token, ptype) if token else []})
         return result
     except Exception as e:
         result["reason"] = str(e)[:120]
@@ -1253,6 +1310,24 @@ def _company_finance_focus_text(report_summary):
     return "\n".join(f"- {x}" for x in focus)
 
 
+def _company_gap_detail_text(report_summary):
+    details = report_summary.get("gap_details") or []
+    if not details:
+        return ""
+    total = int((report_summary.get("summary") or {}).get("cm_n") or len(details))
+    lines = [f"**具体成本缺口（共 {total} 条，按销售额从高到低）**",
+             "行号=打开报表后左侧行号；财务可按行号或 MSKU 直接核对。"]
+    for i, g in enumerate(details, start=1):
+        name = f"｜{g['name']}" if g.get("name") else ""
+        owner = g.get("owner") or "-"
+        shop = g.get("shop") or "-"
+        msku = g.get("msku") or "-"
+        lines.append(f"{i}. 行{g['row']}｜{shop}｜{msku}{name}｜{owner}｜销售 {_company_money(g.get('sales_rmb'))}｜采购成本 0")
+    if total > len(details):
+        lines.append(f"还有 {total - len(details)} 条未在卡片展开，请在报表中筛选采购成本=0。")
+    return "\n".join(lines)
+
+
 def _company_finance_block_reason(T, run_id, report_summary):
     open_p0 = _company_open_p0_count(T, run_id)
     if open_p0 > 0:
@@ -1277,6 +1352,9 @@ def _company_apply_report_audit_gate(T, run):
     period = ft(fields.get("期间"))
     ident = _company_meta_from_run(fields)
     detail = f"AI初审发现 {cm_n} 个采购成本缺口，涉及销售 {_company_money(summary.get('cm_amt'))}。成本补齐或确认例外前不能进入财务终审。"
+    gap_detail_text = _company_gap_detail_text(report_summary)
+    if gap_detail_text:
+        detail += "\n\n" + gap_detail_text
     _company_create_gap(T, run_id, period, ident["channel"], "master_data_gap", detail,
                         p_level="P0", owner="采购/负责人")
     _company_update_run(T, run_id, {"报表状态": "P0待处理", "当前阻断方": "采购/负责人",
@@ -1382,6 +1460,11 @@ def _company_finance_card(T, run, *, test_mode=False, test_note=None):
     elements += [
         _company_md(_company_finance_audit_text(T, run_id, rf, report_summary)),
         {"tag": "hr"},
+    ]
+    gap_detail_text = _company_gap_detail_text(report_summary)
+    if gap_detail_text:
+        elements += [_company_md(gap_detail_text), {"tag": "hr"}]
+    elements += [
         _company_md("**财务重点看这里**\n" + _company_finance_focus_text(report_summary)),
         {"tag": "hr"},
     ]
