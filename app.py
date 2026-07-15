@@ -1364,6 +1364,16 @@ def _company_apply_report_audit_gate(T, run):
     return _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or run
 
 
+def _company_first_open_p0_gap(T, run_id):
+    for rec in _bitable_all(T, IDX_APP, COMPANY_GAP_TBL):
+        f = rec.get("fields", {})
+        if ft(f.get("run_id")) != run_id:
+            continue
+        if ft(f.get("P级")) == "P0" and ft(f.get("处理结果")) not in ("已补件", "确认例外", "已关闭"):
+            return rec
+    return None
+
+
 def _company_processed_card(title, message, ok=True, details=None):
     details = details or {}
     elements = [_company_md(message)]
@@ -1783,8 +1793,14 @@ async def profit_workflow_test_cards(request: Request):
                                             "最后动作": "send_finance_test_card"})
             run = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or run
         run = _company_apply_report_audit_gate(T, run)
-        test_note = "测试卡，仅发给 Frankie、吴晓丹和财务部；不会影响真实报表。" if recipient_mode == "finance_gray" else None
-        cards["finance"] = _company_finance_card(T, run, test_mode=True, test_note=test_note)
+        if _company_open_p0_count(T, run_id) > 0:
+            if recipient_mode == "finance_gray" and send:
+                raise HTTPException(409, "AI初审发现P0缺口，财务终审卡未发送；请先处理P0。")
+            gap = _company_first_open_p0_gap(T, run_id)
+            cards["p0_gap"] = _company_gap_card(run, gap or {"fields": {}}, test_mode=True)
+        else:
+            test_note = "测试卡，仅发给 Frankie、吴晓丹和财务部；不会影响真实报表。" if recipient_mode == "finance_gray" else None
+            cards["finance"] = _company_finance_card(T, run, test_mode=True, test_note=test_note)
 
     sent = {}
     if send:
@@ -1792,7 +1808,8 @@ async def profit_workflow_test_cards(request: Request):
         recipients = _company_finance_card_recipients(T, recipient_mode)
         for name, card in cards.items():
             sent[name] = []
-            for recipient in recipients:
+            target_recipients = _company_finance_card_recipients(T, "frankie" if name == "p0_gap" else recipient_mode)
+            for recipient in target_recipients:
                 res = _send_event_card_union(ET, recipient["union_id"], card)
                 mid = (res.get("data") or {}).get("message_id")
                 if mid:
