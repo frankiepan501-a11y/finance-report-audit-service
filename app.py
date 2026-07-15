@@ -1264,6 +1264,28 @@ def _company_finance_block_reason(T, run_id, report_summary):
     return ""
 
 
+def _company_apply_report_audit_gate(T, run):
+    fields = (run or {}).get("fields", {})
+    run_id = ft(fields.get("run_id"))
+    if not run_id:
+        return run
+    report_summary = _company_report_summary(T, fields)
+    summary = report_summary.get("summary") or {}
+    cm_n = int(summary.get("cm_n") or 0)
+    if cm_n <= 0:
+        return run
+    period = ft(fields.get("期间"))
+    ident = _company_meta_from_run(fields)
+    detail = f"AI初审发现 {cm_n} 个采购成本缺口，涉及销售 {_company_money(summary.get('cm_amt'))}。成本补齐或确认例外前不能进入财务终审。"
+    _company_create_gap(T, run_id, period, ident["channel"], "master_data_gap", detail,
+                        p_level="P0", owner="采购/负责人")
+    _company_update_run(T, run_id, {"报表状态": "P0待处理", "当前阻断方": "采购/负责人",
+                                    "缺口责任类型": "master_data_gap",
+                                    "P0数量": str(_company_open_p0_count(T, run_id)),
+                                    "最后动作": "finance_card_report_audit_blocked"})
+    return _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or run
+
+
 def _company_processed_card(title, message, ok=True, details=None):
     details = details or {}
     elements = [_company_md(message)]
@@ -1677,6 +1699,7 @@ async def profit_workflow_test_cards(request: Request):
                                             "P0数量": str(_company_open_p0_count(T, run_id)),
                                             "最后动作": "send_finance_test_card"})
             run = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or run
+        run = _company_apply_report_audit_gate(T, run)
         test_note = "测试卡，仅发给 Frankie、吴晓丹和财务部；不会影响真实报表。" if recipient_mode == "finance_gray" else None
         cards["finance"] = _company_finance_card(T, run, test_mode=True, test_note=test_note)
 
