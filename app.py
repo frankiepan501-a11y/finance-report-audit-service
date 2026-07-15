@@ -3,7 +3,7 @@
 检查: 数据缺漏(空报表) / 采购成本覆盖(有销售但cg=0) / 物流头程覆盖。
 异常 → 飞书卡片发财务部 + Frankie, 列 渠道/店铺/负责人/异常, 让财务跟运营核实。
 口径: 只 flag「销售额>0 且 成本=0」(真异常); 销售=0的0成本行忽略。"""
-import os, json, datetime, hashlib, time, re
+import os, json, datetime, hashlib, time, re, threading
 from collections import defaultdict
 import requests
 from fastapi import FastAPI, Request, HTTPException
@@ -43,6 +43,11 @@ FUNLABSWITCH_SHOPIFY_CUTOFF = "2026-07"
 COMPANY_CALLBACK_SEND_NEXT = os.environ.get("COMPANY_CALLBACK_SEND_NEXT", "false").lower() == "true"
 COMPANY_GENERATOR_ENABLED = os.environ.get("COMPANY_GENERATOR_ENABLED", "false").lower() == "true"
 COMPANY_GENERATOR_TIMEOUT = int(os.environ.get("COMPANY_GENERATOR_TIMEOUT", "30"))
+COMPANY_GENERATOR_REQUEST_TIMEOUT = int(os.environ.get(
+    "COMPANY_GENERATOR_REQUEST_TIMEOUT", str(min(COMPANY_GENERATOR_TIMEOUT, 25))
+))
+COMPANY_GENERATOR_POLL_TIMEOUT = int(os.environ.get("COMPANY_GENERATOR_POLL_TIMEOUT", "360"))
+COMPANY_GENERATOR_POLL_INTERVAL = float(os.environ.get("COMPANY_GENERATOR_POLL_INTERVAL", "5"))
 COMPANY_GENERATOR_ALLOWED_PLATFORMS = {
     p.strip() for p in os.environ.get("COMPANY_GENERATOR_ALLOWED_PLATFORMS", "").split(",") if p.strip()
 }
@@ -53,6 +58,13 @@ _N8N_WEBHOOK_BASE = (os.environ.get("N8N_WEBHOOK_BASE_URL")
 if _N8N_WEBHOOK_BASE.endswith("/api/v1"):
     _N8N_WEBHOOK_BASE = _N8N_WEBHOOK_BASE[:-7].rstrip("/")
 N8N_WEBHOOK_BASE_URL = _N8N_WEBHOOK_BASE
+_N8N_API_BASE = (os.environ.get("N8N_API_BASE_URL") or os.environ.get("N8N_BASE_URL") or N8N_WEBHOOK_BASE_URL).rstrip("/")
+if not _N8N_API_BASE.endswith("/api/v1"):
+    _N8N_API_BASE = f"{_N8N_API_BASE}/api/v1"
+N8N_API_BASE_URL = _N8N_API_BASE
+N8N_API_KEY = os.environ.get("N8N_API_KEY", "")
+_COMPANY_ASYNC_JOBS = {}
+_COMPANY_ASYNC_LOCK = threading.Lock()
 
 COMPANY_PLATFORM_REGISTRY = {
     "amazon": {"name": "Amazon", "platform": "亚马逊", "site": "亚马逊全站", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部", "maturity": "confirmed", "generator_type": "n8n_webhook", "workflow_id": "CyapOmKK0hyIJoXY", "generator_method": "GET", "generator_path": "trigger-amazon-profit"},
@@ -772,6 +784,73 @@ def _company_refresh_report_link(T, run):
     return run
 
 
+def _company_iso_ms(value):
+    text = ft(value)
+    if not text:
+        return 0
+    try:
+        return int(datetime.datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp() * 1000)
+    except Exception:
+        return 0
+
+
+def _company_n8n_executions(workflow_id, limit=8):
+    if not (N8N_API_KEY and workflow_id):
+        return []
+    r = requests.get(
+        f"{N8N_API_BASE_URL}/executions",
+        headers={"X-N8N-API-KEY": N8N_API_KEY},
+        params={"workflowId": workflow_id, "limit": limit},
+        timeout=20,
+    )
+    r.raise_for_status()
+    data = r.json()
+    return data.get("data") or data.get("items") or []
+
+
+def _company_poll_n8n_execution(workflow_id, since_ms, *, timeout_sec=None):
+    timeout_sec = timeout_sec or COMPANY_GENERATOR_POLL_TIMEOUT
+    if not workflow_id:
+        return {"ok": False, "status": "unavailable", "message": "workflow_id missing"}
+    if not N8N_API_KEY:
+        return {"ok": False, "status": "unavailable", "message": "N8N_API_KEY missing"}
+    deadline = time.time() + timeout_sec
+    last_seen = None
+    since_floor = max(0, int(since_ms or 0) - 10000)
+    while time.time() < deadline:
+        try:
+            executions = _company_n8n_executions(workflow_id)
+            candidates = []
+            for exe in executions:
+                started_ms = _company_iso_ms(exe.get("startedAt"))
+                if started_ms >= since_floor:
+                    candidates.append((started_ms, exe))
+            if candidates:
+                candidates.sort(key=lambda item: item[0], reverse=True)
+                exe = candidates[0][1]
+                last_seen = {
+                    "id": ft(exe.get("id")),
+                    "status": ft(exe.get("status")),
+                    "finished": bool(exe.get("finished")),
+                    "startedAt": ft(exe.get("startedAt")),
+                    "stoppedAt": ft(exe.get("stoppedAt")),
+                }
+                terminal = last_seen["finished"] or last_seen["status"] in ("success", "error", "crashed", "canceled", "cancelled")
+                if terminal:
+                    ok = last_seen["status"] == "success" or (last_seen["finished"] and last_seen["status"] not in ("error", "crashed", "canceled", "cancelled"))
+                    return {**last_seen, "ok": ok, "message": "n8n execution finished"}
+        except Exception as e:
+            last_seen = {"status": "poll_error", "message": str(e)[:160]}
+        time.sleep(COMPANY_GENERATOR_POLL_INTERVAL)
+    return {"ok": False, "status": "timeout", "message": "n8n execution poll timeout", "last_seen": last_seen}
+
+
+def _company_trigger_poll_status(status, started_ms):
+    if status.get("type") != "n8n_webhook":
+        return {"ok": False, "status": "unavailable", "message": "poll only supports n8n_webhook"}
+    return _company_poll_n8n_execution(status.get("workflow_id"), started_ms)
+
+
 def _company_trigger_generator(T, run, *, source_action="rerun"):
     fields = (run or {}).get("fields", {})
     run_id = ft(fields.get("run_id"))
@@ -816,12 +895,13 @@ def _company_trigger_generator(T, run, *, source_action="rerun"):
     if record_id:
         body["record_id"] = record_id
 
+    started_ms = _now_ms()
     try:
         if method == "GET":
-            resp = requests.get(status["url"], params=params, headers=headers, timeout=COMPANY_GENERATOR_TIMEOUT)
+            resp = requests.get(status["url"], params=params, headers=headers, timeout=COMPANY_GENERATOR_REQUEST_TIMEOUT)
         else:
             resp = requests.request(method, status["url"], params=params, headers=headers,
-                                    json=body or None, timeout=COMPANY_GENERATOR_TIMEOUT)
+                                    json=body or None, timeout=COMPANY_GENERATOR_REQUEST_TIMEOUT)
         text = resp.text[:1000]
         ok = 200 <= resp.status_code < 300
         run2 = _company_refresh_report_link(T, _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or run)
@@ -833,11 +913,20 @@ def _company_trigger_generator(T, run, *, source_action="rerun"):
                 "http_status": resp.status_code, "message": text[:160],
                 "generator": status, "run": run2 or run}
     except Exception as e:
-        after = {"error": str(e)[:500], "generator": status}
+        poll = _company_trigger_poll_status(status, started_ms)
+        run2 = _company_refresh_report_link(T, _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or run)
+        if poll.get("ok"):
+            after = {"http_error": str(e)[:500], "poll": poll, "run": (run2 or {}).get("fields", {})}
+            _company_update_run(T, run_id, {"最后动作": f"{source_action}_generator_triggered_async"})
+            _company_write_system_audit(T, f"{source_action}_generator_trigger", run_id,
+                                        before, after, {**status, "params": params, "body": body, "poll": poll}, "ok")
+            return {"ok": True, "status": "triggered_async", "message": "n8n execution succeeded after async poll",
+                    "generator": status, "poll": poll, "run": run2 or run}
+        after = {"error": str(e)[:500], "poll": poll, "generator": status, "run": (run2 or {}).get("fields", {})}
         _company_update_run(T, run_id, {"最后动作": f"{source_action}_generator_error"})
         _company_write_system_audit(T, f"{source_action}_generator_error", run_id,
-                                    before, after, status, "error")
-        return {"ok": False, "status": "error", "message": str(e)[:160], "generator": status, "run": run}
+                                    before, after, {**status, "poll": poll}, "error")
+        return {"ok": False, "status": "error", "message": str(e)[:160], "generator": status, "poll": poll, "run": run2 or run}
 
 
 def _company_card_id(card_type, run_id, target_id=""):
@@ -1770,6 +1859,64 @@ def _company_rerun_run(T, run_id, *, send_next=False, recipient_mode="frankie",
     return result
 
 
+def _company_async_job(run_id):
+    with _COMPANY_ASYNC_LOCK:
+        return dict(_COMPANY_ASYNC_JOBS.get(run_id) or {})
+
+
+def _company_set_async_job(run_id, **updates):
+    with _COMPANY_ASYNC_LOCK:
+        job = dict(_COMPANY_ASYNC_JOBS.get(run_id) or {})
+        job.update(updates)
+        job["run_id"] = run_id
+        _COMPANY_ASYNC_JOBS[run_id] = job
+        return dict(job)
+
+
+def _company_async_worker(run_id, *, send_next=False, recipient_mode="frankie", source_action="async_generate"):
+    _company_set_async_job(run_id, status="running", started_at=str(_now_ms()), source_action=source_action)
+    try:
+        T = tok()
+        result = _company_rerun_run(T, run_id, send_next=send_next, recipient_mode=recipient_mode,
+                                    source_action=source_action, trigger_generator=True)
+        generator = result.get("generator") or {}
+        job = _company_set_async_job(
+            run_id,
+            status=result.get("status") or "done",
+            ok=bool(result.get("ok")),
+            open_p0=result.get("open_p0"),
+            next_card=result.get("next_card"),
+            generator_status=generator.get("status"),
+            generator_message=generator.get("message"),
+            finished_at=str(_now_ms()),
+        )
+        return job
+    except Exception as e:
+        msg = str(e)[:300]
+        _company_set_async_job(run_id, status="error", ok=False, error=msg, finished_at=str(_now_ms()))
+        try:
+            T = tok()
+            before = {"run_id": run_id}
+            _company_update_run(T, run_id, {"最后动作": f"{source_action}_async_error"})
+            _company_write_system_audit(T, f"{source_action}_async_error", run_id,
+                                        before, {"error": msg}, {"source_action": source_action}, "error")
+        except Exception:
+            pass
+        return None
+
+
+def _company_start_async_run(run_id, *, send_next=False, recipient_mode="frankie", source_action="async_generate"):
+    job = _company_set_async_job(run_id, status="queued", queued_at=str(_now_ms()),
+                                 source_action=source_action, recipient_mode=recipient_mode,
+                                 send_next=bool(send_next))
+    th = threading.Thread(target=_company_async_worker,
+                          kwargs={"run_id": run_id, "send_next": send_next,
+                                  "recipient_mode": recipient_mode, "source_action": source_action},
+                          daemon=True)
+    th.start()
+    return job
+
+
 def _company_processed_card(title, message, ok=True, details=None):
     details = details or {}
     elements = [_company_md(message)]
@@ -2201,6 +2348,7 @@ async def profit_workflow_run_month(request: Request):
     send = q.get("send") == "true"
     include_cards = q.get("include_cards") == "true"
     generate = q.get("generate") == "true"
+    async_generate = q.get("async") == "true" or q.get("async_generate") == "true"
     if recipient_mode not in ("frankie", "finance_gray"):
         raise HTTPException(400, "recipient_mode must be frankie or finance_gray")
 
@@ -2211,8 +2359,34 @@ async def profit_workflow_run_month(request: Request):
     for pid in platform_ids:
         run = _company_seed_run(T, period, pid, report_period=report_period)
         run_id = ft((run or {}).get("fields", {}).get("run_id"))
+        generator_status = _company_generator_status((run.get("fields") or {}), T=T)
+        if generate and async_generate and generator_status.get("ready"):
+            before = {"run": (run or {}).get("fields", {}), "generator": generator_status}
+            run = _company_update_run(T, run_id, {"报表状态": "AI生成中", "当前阻断方": "AI自动化",
+                                                 "最后动作": "run_month_generator_async_started"}) or run
+            _company_write_system_audit(T, "run_month_generator_async_started", run_id,
+                                        before, {"run": (run or {}).get("fields", {})},
+                                        {"source_action": "run_month_async", "generator": generator_status}, "ok")
+            job = _company_start_async_run(run_id, send_next=send, recipient_mode=recipient_mode,
+                                           source_action="run_month_async")
+            results.append({
+                "platform": pid,
+                "run_id": run_id,
+                "status": "generator_async_started",
+                "open_p0": _company_open_p0_count(T, run_id),
+                "next_card": None,
+                "message": "生成器已转后台执行；请用 /profit-workflow/poll-run 查询或补账。",
+                "generator": {"status": "async_started", "message": "background generator job started",
+                              "ready": generator_status.get("ready"), "allowed": generator_status.get("allowed"),
+                              "type": generator_status.get("type"),
+                              "workflow_id": generator_status.get("workflow_id")},
+                "async_job": job,
+                "sent": [],
+                "report_link": ft((run.get("fields") or {}).get("报表链接")),
+            })
+            continue
         generator = _company_trigger_generator(T, run, source_action="run_month") if generate else {
-            "status": "not_requested", "message": "本次月度编排未请求生成器触发。", "generator": _company_generator_status(run.get("fields", {}), T=T), "run": run
+            "status": "not_requested", "message": "本次月度编排未请求生成器触发。", "generator": generator_status, "run": run
         }
         run = generator.get("run") or run
         audit = _company_audit_run_cycle(T, run, source_action="run_month")
@@ -2248,7 +2422,7 @@ async def profit_workflow_run_month(request: Request):
         })
     return {"period": period, "report_period": report_period or period, "scope": scope,
             "platforms": platform_ids, "recipient_mode": recipient_mode, "generate": generate,
-            "send": send, "results": results,
+            "async_generate": async_generate, "send": send, "results": results,
             "card_template": {"schema": COMPANY_CARD_SCHEMA, "version": COMPANY_CARD_TEMPLATE_VERSION},
             "cards": cards if include_cards else {},
             "ledger": {"run_table": COMPANY_RUN_TBL, "gap_table": COMPANY_GAP_TBL, "audit_table": COMPANY_AUDIT_TBL}}
@@ -2271,7 +2445,34 @@ async def profit_workflow_rerun(request: Request):
     if recipient_mode not in ("frankie", "finance_gray"):
         raise HTTPException(400, "recipient_mode must be frankie or finance_gray")
     generate = q.get("generate", "true") != "false"
+    async_generate = q.get("async") == "true" or q.get("async_generate") == "true"
     T = tok()
+    if generate and async_generate:
+        run = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id)
+        if not run:
+            raise HTTPException(404, f"run not found: {run_id}")
+        generator_status = _company_generator_status((run.get("fields") or {}), T=T)
+        if generator_status.get("ready"):
+            before = {"run": (run or {}).get("fields", {}), "generator": generator_status}
+            run = _company_update_run(T, run_id, {"报表状态": "AI生成中", "当前阻断方": "AI自动化",
+                                                 "最后动作": "manual_rerun_generator_async_started"}) or run
+            _company_write_system_audit(T, "manual_rerun_generator_async_started", run_id,
+                                        before, {"run": (run or {}).get("fields", {})},
+                                        {"source_action": "manual_rerun_async", "generator": generator_status}, "ok")
+            job = _company_start_async_run(run_id, send_next=q.get("send") == "true",
+                                           recipient_mode=recipient_mode, source_action="manual_rerun_async")
+            return {"run_id": run_id, "recipient_mode": recipient_mode, "send": q.get("send") == "true",
+                    "generate": generate, "async_generate": async_generate,
+                    "status": "generator_async_started", "open_p0": _company_open_p0_count(T, run_id),
+                    "next_card": None, "sent": [],
+                    "generator": {"status": "async_started", "message": "background generator job started",
+                                  "ready": generator_status.get("ready"),
+                                  "allowed": generator_status.get("allowed"),
+                                  "type": generator_status.get("type"),
+                                  "workflow_id": generator_status.get("workflow_id")},
+                    "async_job": job,
+                    "message": "生成器已转后台执行；请用 /profit-workflow/poll-run 查询或补账。",
+                    "ledger": {"run_table": COMPANY_RUN_TBL, "gap_table": COMPANY_GAP_TBL, "audit_table": COMPANY_AUDIT_TBL}}
     result = _company_rerun_run(T, run_id, send_next=q.get("send") == "true",
                                 recipient_mode=recipient_mode, source_action="manual_rerun",
                                 trigger_generator=generate)
@@ -2279,6 +2480,7 @@ async def profit_workflow_rerun(request: Request):
         raise HTTPException(404, result.get("message"))
     return {"run_id": run_id, "recipient_mode": recipient_mode, "send": q.get("send") == "true",
             "generate": generate,
+            "async_generate": async_generate,
             "status": result.get("status"), "open_p0": result.get("open_p0"),
             "next_card": result.get("next_card"), "sent": result.get("sent"),
             "generator": {"status": (result.get("generator") or {}).get("status"),
@@ -2289,6 +2491,51 @@ async def profit_workflow_rerun(request: Request):
                           "workflow_id": ((result.get("generator") or {}).get("generator") or {}).get("workflow_id")},
             "message": result.get("message"),
             "ledger": {"run_table": COMPANY_RUN_TBL, "gap_table": COMPANY_GAP_TBL, "audit_table": COMPANY_AUDIT_TBL}}
+
+
+@app.api_route("/profit-workflow/poll-run", methods=["GET", "POST"])
+async def profit_workflow_poll_run(request: Request):
+    """Poll one run after async generation. Optional reconcile=true refreshes report link and runs AI audit."""
+    if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
+        raise HTTPException(401, "unauthorized")
+    q = request.query_params
+    run_id = q.get("run_id")
+    if not run_id:
+        period = q.get("period") or _last_month()
+        platform_id = q.get("platform")
+        if not platform_id:
+            raise HTTPException(400, "run_id or platform is required")
+        run_id = _company_run_id(period, platform_id)
+    T = tok()
+    run = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id)
+    if not run:
+        raise HTTPException(404, f"run not found: {run_id}")
+    reconcile = q.get("reconcile") == "true"
+    audit = None
+    if reconcile:
+        run = _company_refresh_report_link(T, run)
+        audit = _company_audit_run_cycle(T, run, source_action=q.get("source_action") or "manual_poll")
+        run = audit.get("run") or run
+    run = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or run
+    fields = run.get("fields", {})
+    return {
+        "run_id": run_id,
+        "async_job": _company_async_job(run_id),
+        "reconcile": reconcile,
+        "audit": {"status": audit.get("status"), "open_p0": audit.get("open_p0"),
+                  "message": audit.get("message")} if audit else None,
+        "run": {
+            "报表状态": ft(fields.get("报表状态")),
+            "P0数量": ft(fields.get("P0数量")),
+            "当前阻断方": ft(fields.get("当前阻断方")),
+            "缺口责任类型": ft(fields.get("缺口责任类型")),
+            "总表状态": ft(fields.get("总表状态")),
+            "报表链接": ft(fields.get("报表链接")),
+            "最后动作": ft(fields.get("最后动作")),
+            "最后动作时间": ft(fields.get("最后动作时间")),
+        },
+        "ledger": {"run_table": COMPANY_RUN_TBL, "gap_table": COMPANY_GAP_TBL, "audit_table": COMPANY_AUDIT_TBL},
+    }
 
 
 @app.post("/profit-workflow/test-cards")
