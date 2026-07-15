@@ -38,22 +38,31 @@ COMPANY_AUDIT_TBL = os.environ.get("COMPANY_PROFIT_AUDIT_TABLE_ID", "tblVan2P6bs
 COMPANY_CARD_SCHEMA = "company_profit_card_v3"
 COMPANY_CARD_TEMPLATE_VERSION = "v4-finance-summary-permission"
 COMPANY_CALLBACK_SEND_NEXT = os.environ.get("COMPANY_CALLBACK_SEND_NEXT", "false").lower() == "true"
+COMPANY_GENERATOR_ENABLED = os.environ.get("COMPANY_GENERATOR_ENABLED", "false").lower() == "true"
+COMPANY_GENERATOR_TIMEOUT = int(os.environ.get("COMPANY_GENERATOR_TIMEOUT", "30"))
+_N8N_WEBHOOK_BASE = (os.environ.get("N8N_WEBHOOK_BASE_URL")
+                     or os.environ.get("N8N_PUBLIC_BASE_URL")
+                     or os.environ.get("N8N_BASE_URL")
+                     or "https://frankiepan501.zeabur.app").rstrip("/")
+if _N8N_WEBHOOK_BASE.endswith("/api/v1"):
+    _N8N_WEBHOOK_BASE = _N8N_WEBHOOK_BASE[:-7].rstrip("/")
+N8N_WEBHOOK_BASE_URL = _N8N_WEBHOOK_BASE
 
 COMPANY_PLATFORM_REGISTRY = {
-    "amazon": {"name": "Amazon", "platform": "亚马逊", "site": "亚马逊全站", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部"},
-    "walmart": {"name": "Walmart", "platform": "沃尔玛", "site": "沃尔玛全站", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部"},
-    "mercadolibre": {"name": "Mercado Libre", "platform": "美客多", "site": "美客多店铺组", "data_mode": "hybrid", "data_status": "数据已就绪", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部"},
-    "funlab_net": {"name": "funlab.net", "platform": "独立站", "site": "funlab.net", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部"},
-    "powkong": {"name": "Powkong", "platform": "独立站", "site": "powkong.com", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部"},
-    "domestic_ecom": {"name": "国内电商", "platform": "国内电商", "site": "国内电商店铺组", "data_mode": "manual", "data_status": "资料已提交", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部"},
-    "funlabswitch": {"name": "funlabswitch.com", "platform": "独立站", "site": "funlabswitch.com", "data_mode": "hybrid", "data_status": "待成本维护", "report_status": "P0待处理", "blocker_type": "master_data_gap", "blocker": "采购/负责人"},
-    "aliexpress": {"name": "AliExpress", "platform": "速卖通", "site": "速卖通店铺组", "data_mode": "api", "data_status": "取数完成", "report_status": "待接统一终审", "blocker_type": "workflow_gap", "blocker": "AI自动化"},
-    "tiktok_shop": {"name": "TikTok Shop", "platform": "TikTok Shop", "site": "TikTok Shop店铺组", "data_mode": "api", "data_status": "取数完成", "report_status": "待接统一终审", "blocker_type": "workflow_gap", "blocker": "AI自动化"},
-    "b2b": {"name": "B2B", "platform": "B2B", "site": "B2B业务台账", "data_mode": "ledger", "data_status": "台账已就绪", "report_status": "待接台账模式", "blocker_type": "workflow_gap", "blocker": "AI自动化"},
-    "offline": {"name": "国内线下", "platform": "国内线下", "site": "国内线下业务台账", "data_mode": "ledger", "data_status": "台账已就绪", "report_status": "待接台账模式", "blocker_type": "workflow_gap", "blocker": "AI自动化"},
-    "temu": {"name": "TEMU", "platform": "TEMU", "site": "TEMU店铺组", "data_mode": "manual", "data_status": "待资料提交", "report_status": "待定口径", "blocker_type": "finance_rule_gap", "blocker": "财务/负责人"},
-    "taobao": {"name": "淘宝", "platform": "淘宝", "site": "淘宝店铺组", "data_mode": "manual", "data_status": "待资料提交", "report_status": "待定口径", "blocker_type": "finance_rule_gap", "blocker": "财务/负责人"},
-    "pinduoduo": {"name": "拼多多", "platform": "拼多多", "site": "拼多多店铺组", "data_mode": "manual", "data_status": "待资料提交", "report_status": "待定口径", "blocker_type": "finance_rule_gap", "blocker": "财务/负责人"},
+    "amazon": {"name": "Amazon", "platform": "亚马逊", "site": "亚马逊全站", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部", "maturity": "confirmed", "generator_type": "n8n_webhook", "workflow_id": "CyapOmKK0hyIJoXY", "generator_method": "GET", "generator_path": "trigger-amazon-profit"},
+    "walmart": {"name": "Walmart", "platform": "沃尔玛", "site": "沃尔玛全站", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部", "maturity": "confirmed", "generator_type": "n8n_webhook", "workflow_id": "HETbzME852KlYpFl", "generator_method": "GET", "generator_path": "trigger-walmart-profit"},
+    "mercadolibre": {"name": "Mercado Libre", "platform": "美客多", "site": "美客多店铺组", "data_mode": "hybrid", "data_status": "数据已就绪", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部", "maturity": "confirmed", "generator_type": "ml_sync_service", "service_base_url": "https://ml-sync.zeabur.app", "generator_note": "按 seller_id 同步，不是公司级一键全店月报触发。", "generator_requires": "seller_id"},
+    "funlab_net": {"name": "funlab.net", "platform": "独立站", "site": "funlab.net", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部", "maturity": "confirmed", "generator_type": "n8n_webhook", "workflow_id": "2q7WSFS5G9zQpfcN", "generator_method": "GET", "generator_path": "trigger-funlabnet-profit"},
+    "powkong": {"name": "Powkong", "platform": "独立站", "site": "powkong.com", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部", "maturity": "confirmed", "generator_type": "n8n_webhook", "workflow_id": "rkG32295bx3dVcRh", "generator_method": "GET", "generator_path": "trigger-powkong-shopify-admin-profit"},
+    "domestic_ecom": {"name": "国内电商", "platform": "国内电商", "site": "国内电商店铺组", "data_mode": "manual", "data_status": "资料已提交", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部", "maturity": "confirmed", "generator_type": "service_endpoint", "service_base_url": "https://domestic-ecom-profit.zeabur.app", "service_endpoint": "/profit/run", "generator_method": "POST", "auth_token_env": "DOMESTIC_ECOM_PROFIT_TOKEN", "generator_requires": "source_record_id", "generator_note": "需要国内电商任务台 record_id，不能只用公司级 run_id 触发。"},
+    "funlabswitch": {"name": "funlabswitch.com", "platform": "独立站", "site": "funlabswitch.com", "data_mode": "hybrid", "data_status": "待成本维护", "report_status": "P0待处理", "blocker_type": "master_data_gap", "blocker": "采购/负责人", "maturity": "blocked", "generator_type": "n8n_webhook", "workflow_id": "s9u91925K049t7ud", "generator_method": "GET", "generator_path": "trigger-funlabswitch-profit"},
+    "aliexpress": {"name": "AliExpress", "platform": "速卖通", "site": "速卖通店铺组", "data_mode": "api", "data_status": "取数完成", "report_status": "待接统一终审", "blocker_type": "workflow_gap", "blocker": "AI自动化", "maturity": "partial", "generator_type": "n8n_webhook", "workflow_id": "eQBUjKcBr30zgBgy", "generator_method": "GET", "generator_path": "trigger-aliexpress-profit"},
+    "tiktok_shop": {"name": "TikTok Shop", "platform": "TikTok Shop", "site": "TikTok Shop店铺组", "data_mode": "api", "data_status": "取数完成", "report_status": "待接统一终审", "blocker_type": "workflow_gap", "blocker": "AI自动化", "maturity": "partial", "generator_type": "n8n_webhook", "workflow_id": "Zw17LKlAL6W9TC0V", "generator_method": "GET", "generator_path": "trigger-tiktok-profit"},
+    "b2b": {"name": "B2B", "platform": "B2B", "site": "B2B业务台账", "data_mode": "ledger", "data_status": "台账已就绪", "report_status": "待接台账模式", "blocker_type": "workflow_gap", "blocker": "AI自动化", "maturity": "partial", "generator_type": "ledger_service", "generator_note": "待补 B2B 台账完整性审计与总表触发。"},
+    "offline": {"name": "国内线下", "platform": "国内线下", "site": "国内线下业务台账", "data_mode": "ledger", "data_status": "台账已就绪", "report_status": "待接台账模式", "blocker_type": "workflow_gap", "blocker": "AI自动化", "maturity": "partial", "generator_type": "ledger_service", "generator_note": "待补国内线下台账完整性审计与总表触发。"},
+    "temu": {"name": "TEMU", "platform": "TEMU", "site": "TEMU店铺组", "data_mode": "manual", "data_status": "待资料提交", "report_status": "待定口径", "blocker_type": "finance_rule_gap", "blocker": "财务/负责人", "maturity": "unconfirmed", "generator_type": "", "generator_note": "待完成平台口径与 A/B 逐字段核实。"},
+    "taobao": {"name": "淘宝", "platform": "淘宝", "site": "淘宝店铺组", "data_mode": "manual", "data_status": "待资料提交", "report_status": "待定口径", "blocker_type": "finance_rule_gap", "blocker": "财务/负责人", "maturity": "unconfirmed", "generator_type": "", "generator_note": "待完成平台口径与 A/B 逐字段核实。"},
+    "pinduoduo": {"name": "拼多多", "platform": "拼多多", "site": "拼多多店铺组", "data_mode": "manual", "data_status": "待资料提交", "report_status": "待定口径", "blocker_type": "finance_rule_gap", "blocker": "财务/负责人", "maturity": "unconfirmed", "generator_type": "", "generator_note": "待完成平台口径与 A/B 逐字段核实。"},
 }
 
 COMPANY_REPORT_FIELD_BY_PLATFORM = {
@@ -601,6 +610,149 @@ def _company_report_link(T, period, platform_id, *, report_period=None):
         return ""
     ym_slash = lookup_period.replace("-", "/")
     return _idx_links_all(T, ym_slash).get(field) or ""
+
+
+def _company_generator_url(meta):
+    meta = meta or {}
+    explicit_env = ft(meta.get("generator_url_env"))
+    if explicit_env and os.environ.get(explicit_env):
+        return os.environ[explicit_env].rstrip("/")
+    gtype = ft(meta.get("generator_type"))
+    if gtype == "n8n_webhook":
+        path = ft(meta.get("generator_path")).strip("/")
+        return f"{N8N_WEBHOOK_BASE_URL}/webhook/{path}" if path else ""
+    if gtype == "service_endpoint":
+        base = (os.environ.get(ft(meta.get("service_base_url_env"))) or ft(meta.get("service_base_url"))).rstrip("/")
+        endpoint = ft(meta.get("service_endpoint")).lstrip("/")
+        return f"{base}/{endpoint}" if base and endpoint else ""
+    return ""
+
+
+def _company_generator_record_id(payload):
+    for key in ("source_record_id", "task_record_id", "generator_record_id"):
+        value = ft((payload or {}).get(key))
+        if value:
+            return value
+    return ""
+
+
+def _company_generator_status(fields):
+    payload = _company_run_payload(fields)
+    meta = payload.get("meta") or {}
+    platform_id = ft(payload.get("platform_id"))
+    gtype = ft(meta.get("generator_type"))
+    url = _company_generator_url(meta)
+    required = ft(meta.get("generator_requires"))
+    missing = []
+    if not gtype:
+        missing.append("generator_type")
+    if gtype in ("n8n_webhook", "service_endpoint") and not url:
+        missing.append("generator_url")
+    if required == "source_record_id" and not _company_generator_record_id(payload):
+        missing.append("source_record_id")
+    if required == "seller_id" and not ft(payload.get("seller_id")):
+        missing.append("seller_id")
+    auth_env = ft(meta.get("auth_token_env"))
+    if auth_env and not os.environ.get(auth_env):
+        missing.append(auth_env)
+    direct_types = {"n8n_webhook", "service_endpoint"}
+    direct = gtype in direct_types and not missing
+    if not gtype:
+        reason = "此平台还未登记自动生成器。"
+    elif missing:
+        reason = "生成器还不能直接触发，缺少：" + ", ".join(missing)
+    elif gtype not in direct_types:
+        reason = ft(meta.get("generator_note")) or "此生成器不是公司级直接触发入口。"
+    else:
+        reason = "生成器已登记，可在开关打开后触发。"
+    return {
+        "platform_id": platform_id,
+        "type": gtype or "",
+        "workflow_id": ft(meta.get("workflow_id")),
+        "method": ft(meta.get("generator_method")) or "GET",
+        "url": url,
+        "requires": required,
+        "missing": missing,
+        "direct": direct,
+        "enabled": COMPANY_GENERATOR_ENABLED,
+        "ready": direct and COMPANY_GENERATOR_ENABLED,
+        "note": ft(meta.get("generator_note")),
+        "reason": reason,
+    }
+
+
+def _company_refresh_report_link(T, run):
+    fields = (run or {}).get("fields", {})
+    run_id = ft(fields.get("run_id"))
+    payload = _company_run_payload(fields)
+    platform_id = ft(payload.get("platform_id"))
+    period = ft(fields.get("期间"))
+    if not (run_id and platform_id and period):
+        return run
+    report_period = ft(payload.get("report_period")) or period
+    link = _company_report_link(T, period, platform_id, report_period=report_period)
+    if link and link != ft(fields.get("报表链接")):
+        return _company_update_run(T, run_id, {"报表链接": link, "最后动作": "generator_refreshed_report_link"}) or run
+    return run
+
+
+def _company_trigger_generator(T, run, *, source_action="rerun"):
+    fields = (run or {}).get("fields", {})
+    run_id = ft(fields.get("run_id"))
+    status = _company_generator_status(fields)
+    before = {"run": fields, "generator": status}
+    if not run_id:
+        return {"ok": False, "status": "invalid", "message": "run_id missing", "generator": status, "run": run}
+    if not status["direct"]:
+        after = {"generator": status}
+        _company_update_run(T, run_id, {"最后动作": f"{source_action}_generator_not_ready"})
+        _company_write_system_audit(T, f"{source_action}_generator_not_ready", run_id,
+                                    before, after, status, "skipped")
+        return {"ok": False, "status": "not_ready", "message": status["reason"], "generator": status, "run": run}
+    if not COMPANY_GENERATOR_ENABLED:
+        after = {"generator": status}
+        _company_update_run(T, run_id, {"最后动作": f"{source_action}_generator_skipped_disabled"})
+        _company_write_system_audit(T, f"{source_action}_generator_skipped_disabled", run_id,
+                                    before, after, status, "skipped")
+        return {"ok": False, "status": "skipped_disabled", "message": "生成器已登记，但 COMPANY_GENERATOR_ENABLED=false，本次没有触发外部报表。", "generator": status, "run": run}
+
+    payload = _company_run_payload(fields)
+    period = ft(fields.get("期间"))
+    report_period = ft(payload.get("report_period")) or period
+    params = {"period": period, "month": report_period, "run_id": run_id, "source": source_action}
+    headers = {}
+    meta = payload.get("meta") or {}
+    auth_env = ft(meta.get("auth_token_env"))
+    if auth_env and os.environ.get(auth_env):
+        headers["Authorization"] = f"Bearer {os.environ[auth_env]}"
+    method = (status["method"] or "GET").upper()
+    body = {}
+    record_id = _company_generator_record_id(payload)
+    if record_id:
+        body["record_id"] = record_id
+
+    try:
+        if method == "GET":
+            resp = requests.get(status["url"], params=params, headers=headers, timeout=COMPANY_GENERATOR_TIMEOUT)
+        else:
+            resp = requests.request(method, status["url"], params=params, headers=headers,
+                                    json=body or None, timeout=COMPANY_GENERATOR_TIMEOUT)
+        text = resp.text[:1000]
+        ok = 200 <= resp.status_code < 300
+        run2 = _company_refresh_report_link(T, _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or run)
+        after = {"http_status": resp.status_code, "body": text, "run": (run2 or {}).get("fields", {})}
+        _company_update_run(T, run_id, {"最后动作": f"{source_action}_generator_triggered" if ok else f"{source_action}_generator_failed"})
+        _company_write_system_audit(T, f"{source_action}_generator_trigger", run_id,
+                                    before, after, {**status, "params": params, "body": body}, "ok" if ok else "error")
+        return {"ok": ok, "status": "triggered" if ok else "failed",
+                "http_status": resp.status_code, "message": text[:160],
+                "generator": status, "run": run2 or run}
+    except Exception as e:
+        after = {"error": str(e)[:500], "generator": status}
+        _company_update_run(T, run_id, {"最后动作": f"{source_action}_generator_error"})
+        _company_write_system_audit(T, f"{source_action}_generator_error", run_id,
+                                    before, after, status, "error")
+        return {"ok": False, "status": "error", "message": str(e)[:160], "generator": status, "run": run}
 
 
 def _company_card_id(card_type, run_id, target_id=""):
@@ -1497,13 +1649,18 @@ def _company_send_workflow_card(T, run, card_name, card, recipient_mode):
     return sent
 
 
-def _company_rerun_run(T, run_id, *, send_next=False, recipient_mode="frankie", source_action="rerun"):
+def _company_rerun_run(T, run_id, *, send_next=False, recipient_mode="frankie",
+                       source_action="rerun", trigger_generator=True):
     run = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id)
     if not run:
         return {"ok": False, "status": "not_found", "message": f"run not found: {run_id}"}
     _company_update_run(T, run_id, {"报表状态": "AI生成中", "当前阻断方": "AI自动化",
                                     "最后动作": f"{source_action}_rerun_started"})
     run = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or run
+    generator = _company_trigger_generator(T, run, source_action=source_action) if trigger_generator else {
+        "status": "not_requested", "message": "本次未请求生成器触发。", "generator": _company_generator_status(run.get("fields", {})), "run": run
+    }
+    run = generator.get("run") or _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or run
     result = _company_audit_run_cycle(T, run, source_action=source_action)
     run = result.get("run") or run
     card_name = None
@@ -1516,7 +1673,7 @@ def _company_rerun_run(T, run_id, *, send_next=False, recipient_mode="frankie", 
         card_name = "p0_gap"
         card = _company_gap_card(run, result["gap"], test_mode=(recipient_mode == "frankie"))
     sent = _company_send_workflow_card(T, run, card_name, card, recipient_mode) if (send_next and card) else []
-    result.update({"next_card": card_name, "sent": sent})
+    result.update({"next_card": card_name, "sent": sent, "generator": generator})
     return result
 
 
@@ -1910,6 +2067,31 @@ async def profit_workflow_seed(request: Request):
     return {"period": period, "seeded": rows, "run_table": COMPANY_RUN_TBL}
 
 
+@app.get("/profit-workflow/generators")
+async def profit_workflow_generators(request: Request):
+    """Read-only generator registry audit. Does not trigger any external workflow."""
+    if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
+        raise HTTPException(401, "unauthorized")
+    q = request.query_params
+    period = q.get("period") or _last_month()
+    scope = q.get("scope") or "v1"
+    platform_param = q.get("platform") or ""
+    platform_ids = _company_platform_ids(platform_param, scope)
+    rows = []
+    for pid in platform_ids:
+        _, meta = _company_platform(pid)
+        fields = {"payload_json": _compact_json({"platform_id": pid, "meta": meta, "report_period": period})}
+        rows.append({
+            "platform": pid,
+            "name": meta.get("name"),
+            "data_mode": meta.get("data_mode"),
+            "maturity": meta.get("maturity", ""),
+            "generator": _company_generator_status(fields),
+        })
+    return {"period": period, "scope": scope, "generator_enabled": COMPANY_GENERATOR_ENABLED,
+            "n8n_webhook_base": N8N_WEBHOOK_BASE_URL, "platforms": rows}
+
+
 @app.post("/profit-workflow/run-month")
 async def profit_workflow_run_month(request: Request):
     """Production-oriented monthly orchestrator: seed runs, run AI initial audit, then route P0 or finance cards."""
@@ -1923,6 +2105,7 @@ async def profit_workflow_run_month(request: Request):
     recipient_mode = q.get("recipient_mode") or "frankie"
     send = q.get("send") == "true"
     include_cards = q.get("include_cards") == "true"
+    generate = q.get("generate") == "true"
     if recipient_mode not in ("frankie", "finance_gray"):
         raise HTTPException(400, "recipient_mode must be frankie or finance_gray")
 
@@ -1933,6 +2116,10 @@ async def profit_workflow_run_month(request: Request):
     for pid in platform_ids:
         run = _company_seed_run(T, period, pid, report_period=report_period)
         run_id = ft((run or {}).get("fields", {}).get("run_id"))
+        generator = _company_trigger_generator(T, run, source_action="run_month") if generate else {
+            "status": "not_requested", "message": "本次月度编排未请求生成器触发。", "generator": _company_generator_status(run.get("fields", {})), "run": run
+        }
+        run = generator.get("run") or run
         audit = _company_audit_run_cycle(T, run, source_action="run_month")
         run = audit.get("run") or run
         card_name = None
@@ -1956,11 +2143,15 @@ async def profit_workflow_run_month(request: Request):
             "open_p0": audit.get("open_p0", _company_open_p0_count(T, run_id)),
             "next_card": card_name,
             "message": audit.get("message"),
+            "generator": {"status": generator.get("status"), "message": generator.get("message"),
+                          "ready": (generator.get("generator") or {}).get("ready"),
+                          "type": (generator.get("generator") or {}).get("type"),
+                          "workflow_id": (generator.get("generator") or {}).get("workflow_id")},
             "sent": sent,
             "report_link": ft((run.get("fields") or {}).get("报表链接")),
         })
     return {"period": period, "report_period": report_period or period, "scope": scope,
-            "platforms": platform_ids, "recipient_mode": recipient_mode,
+            "platforms": platform_ids, "recipient_mode": recipient_mode, "generate": generate,
             "send": send, "results": results,
             "card_template": {"schema": COMPANY_CARD_SCHEMA, "version": COMPANY_CARD_TEMPLATE_VERSION},
             "cards": cards if include_cards else {},
@@ -1983,14 +2174,22 @@ async def profit_workflow_rerun(request: Request):
     recipient_mode = q.get("recipient_mode") or "frankie"
     if recipient_mode not in ("frankie", "finance_gray"):
         raise HTTPException(400, "recipient_mode must be frankie or finance_gray")
+    generate = q.get("generate", "true") != "false"
     T = tok()
     result = _company_rerun_run(T, run_id, send_next=q.get("send") == "true",
-                                recipient_mode=recipient_mode, source_action="manual_rerun")
+                                recipient_mode=recipient_mode, source_action="manual_rerun",
+                                trigger_generator=generate)
     if result.get("status") == "not_found":
         raise HTTPException(404, result.get("message"))
     return {"run_id": run_id, "recipient_mode": recipient_mode, "send": q.get("send") == "true",
+            "generate": generate,
             "status": result.get("status"), "open_p0": result.get("open_p0"),
             "next_card": result.get("next_card"), "sent": result.get("sent"),
+            "generator": {"status": (result.get("generator") or {}).get("status"),
+                          "message": (result.get("generator") or {}).get("message"),
+                          "ready": ((result.get("generator") or {}).get("generator") or {}).get("ready"),
+                          "type": ((result.get("generator") or {}).get("generator") or {}).get("type"),
+                          "workflow_id": ((result.get("generator") or {}).get("generator") or {}).get("workflow_id")},
             "message": result.get("message"),
             "ledger": {"run_table": COMPANY_RUN_TBL, "gap_table": COMPANY_GAP_TBL, "audit_table": COMPANY_AUDIT_TBL}}
 
