@@ -36,7 +36,7 @@ COMPANY_RUN_TBL = os.environ.get("COMPANY_PROFIT_RUN_TABLE_ID", "tblR2Ft4aN0a6AR
 COMPANY_GAP_TBL = os.environ.get("COMPANY_PROFIT_GAP_TABLE_ID", "tblvJaWomx25pAr3")
 COMPANY_AUDIT_TBL = os.environ.get("COMPANY_PROFIT_AUDIT_TABLE_ID", "tblVan2P6bsGb9em")
 COMPANY_CARD_SCHEMA = "company_profit_card_v3"
-COMPANY_CARD_TEMPLATE_VERSION = "v3-independent-site-business-copy"
+COMPANY_CARD_TEMPLATE_VERSION = "v4-finance-summary-permission"
 
 COMPANY_PLATFORM_REGISTRY = {
     "amazon": {"name": "Amazon", "platform": "亚马逊", "site": "亚马逊全站", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部"},
@@ -363,6 +363,7 @@ def do_audit():
 # ===== 自动授权: 月报生成后给 财务部全体+Frankie+吴晓丹 授权(铁律①) =====
 FIN_DEPT = "od-ad59abe171a6b0a419a5e3969fb349ad"  # 财务部(实时解析成员, 新人自动包含)
 WXD = "ou_c65fc5c31c650790db623640b7ac74f7"        # 吴晓丹
+FINANCE_REPORT_OWNER = os.environ.get("FINANCE_REPORT_OWNER_OPEN_ID", FIN["莫莉莉"])
 # 索引表所有报表字段 → 授权(国内线下=数据app不在此列, 单独权限)
 GRANT_FIELDS = XB_FIELDS + ["美客多毛利报表", "国内电商毛利报表",
                             "独立站funlab.net毛利报表", "独立站funlabswitch毛利报表", "TEMU毛利报表"]
@@ -463,6 +464,18 @@ def _grant_one(T, token, typ, oid, perm):
         return -1
 
 
+def _transfer_owner(T, token, typ, oid):
+    if not token or not typ or not oid:
+        return None
+    try:
+        r = requests.post(f"{FEISHU}/drive/v1/permissions/{token}/members/transfer_owner?type={typ}",
+                          headers={"Authorization": f"Bearer {T}", "Content-Type": "application/json"},
+                          json={"member_type": "openid", "member_id": oid}, timeout=20).json()
+        return r.get("code")
+    except Exception:
+        return -1
+
+
 def _idx_links_all(T, ym_slash):
     items = []; pt = None
     while True:
@@ -484,20 +497,21 @@ def do_grant():
     ym = last.strftime("%Y/%m")
     links = _idx_links_all(T, ym)
     fin = _dept_members(T, FIN_DEPT)  # 财务部全体(实时)
+    finance_full_access = {FRANKIE: "Frankie", WXD: "吴晓丹", FINANCE_REPORT_OWNER: "财务负责人"}
+    finance_full_access.update(fin)
     granted = []
     for fld, url in links.items():
         token, typ = _parse_link(url)
         if not token: continue
-        _grant_one(T, token, typ, FRANKIE, "full_access")
-        _grant_one(T, token, typ, WXD, "edit")
-        for oid in fin:
-            if oid in (FRANKIE, WXD): continue
-            _grant_one(T, token, typ, oid, "view")
+        for oid in finance_full_access:
+            _grant_one(T, token, typ, oid, "full_access")
+        owner_transfer = _transfer_owner(T, token, typ, FINANCE_REPORT_OWNER)
         owners = _owners_for(T, fld)  # 渠道负责人(按职务实时查)
         for oid in owners:
-            if oid in (FRANKIE, WXD) or oid in fin: continue
+            if oid in finance_full_access: continue
             _grant_one(T, token, typ, oid, "view")
-        granted.append({"report": fld, "owners": len(owners)})
+        granted.append({"report": fld, "finance_full_access": len(finance_full_access),
+                        "owner_transfer": owner_transfer, "channel_viewers": len(owners)})
     return {"month": ym, "granted": granted, "finance_members": list(fin.values())}
 
 
@@ -888,12 +902,13 @@ def do_aggregate():
         act = _agg_upsert(T, ym_dash, cat, plat, shop, fields)
         done.append({"shop": shop, "act": act, "sales": round(a["sales"]), "margin": round(a["margin"]), "payback": round(a["payback"]),
                      "cost_missing": (f"{a['cm_n']}SKU ¥{round(cm_amt)}" if a.get("cm_n") else None)})
-    # 总表授权(铁律①): 财务部全体 view + Frankie full + 吴晓丹 edit
+    # 总表授权(铁律①): 财务部全体可管理 + Frankie 可管理
     fin = _dept_members(T, FIN_DEPT)
     _grant_one(T, IDX_APP, "bitable", FRANKIE, "full_access")
-    _grant_one(T, IDX_APP, "bitable", WXD, "edit")
+    _grant_one(T, IDX_APP, "bitable", WXD, "full_access")
+    _grant_one(T, IDX_APP, "bitable", FINANCE_REPORT_OWNER, "full_access")
     for oid in fin:
-        if oid not in (FRANKIE, WXD): _grant_one(T, IDX_APP, "bitable", oid, "view")
+        if oid not in (FRANKIE, WXD, FINANCE_REPORT_OWNER): _grant_one(T, IDX_APP, "bitable", oid, "full_access")
     return {"month": ym_dash, "loaded": done, "skipped": skipped, "errors": errs, "finance_granted": list(fin.values())}
 
 
@@ -1106,6 +1121,138 @@ def _company_mark_finance_approved(T, run_id, before_run):
     }, "财务已确认通过，下一步会写入公司总毛利表。"
 
 
+def _company_run_payload(fields):
+    try:
+        return json.loads(ft(fields.get("payload_json")) or "{}")
+    except Exception:
+        return {}
+
+
+def _company_agg_config(fields):
+    payload = _company_run_payload(fields)
+    platform_id = ft(payload.get("platform_id"))
+    report_field = COMPANY_REPORT_FIELD_BY_PLATFORM.get(platform_id)
+    for item in AGG_REPORTS:
+        if item[0] == report_field:
+            return payload, item
+    return payload, None
+
+
+def _company_sheet_row_count(T, token, ptype):
+    if not token:
+        return None
+    try:
+        prefer = "毛利结果" if ptype == "ecom" else None
+        vals, _ = _sheet_vals(T, token, prefer=prefer)
+        return len([r for r in vals[1:] if any(c not in (None, "") for c in r)]) if vals else None
+    except Exception:
+        return None
+
+
+def _company_report_summary(T, fields):
+    report_link = ft(fields.get("报表链接"))
+    token, typ = _parse_link(report_link)
+    payload, cfg = _company_agg_config(fields)
+    period = ft(payload.get("report_period")) or ft(fields.get("期间"))
+    ym_dash = period.replace("/", "-")
+    result = {"ok": False, "link": report_link, "reason": "", "rows": None}
+    if not report_link:
+        result["reason"] = "没有绑定毛利报表链接"
+        return result
+    if not cfg:
+        result["reason"] = "这个平台还没有接入统一汇总解析"
+        return result
+    fld, cat, plat, shop, brand, ptype = cfg
+    try:
+        if ptype == "xb":
+            if typ != "sheet" or not token:
+                raise ValueError("跨境报表链接不是电子表格")
+            a = _agg_xb(T, token)
+        elif ptype == "ecom":
+            if typ != "sheet" or not token:
+                raise ValueError("国内电商报表链接不是电子表格")
+            a = _agg_ecom(T, token)
+        elif ptype == "ml":
+            a = _agg_ml(T, ym_dash)
+        else:
+            raise ValueError(f"未知报表类型: {ptype}")
+        if not a:
+            result["reason"] = "报表为空或读取失败"
+            return result
+        a = dict(a)
+        a["gross_margin"] = (a.get("margin", 0) / a.get("sales", 0)) if a.get("sales") else 0
+        result.update({"ok": True, "summary": a, "field": fld, "shop": shop,
+                       "rows": _company_sheet_row_count(T, token, ptype)})
+        return result
+    except Exception as e:
+        result["reason"] = str(e)[:120]
+        return result
+
+
+def _company_money(v):
+    return f"¥{_fmt(float(v or 0))}"
+
+
+def _company_pct(v):
+    return f"{float(v or 0) * 100:.1f}%"
+
+
+def _company_gap_rows(T, run_id):
+    rows = []
+    for rec in _bitable_all(T, IDX_APP, COMPANY_GAP_TBL):
+        f = rec.get("fields", {})
+        if ft(f.get("run_id")) != run_id:
+            continue
+        rows.append({
+            "level": ft(f.get("P级")),
+            "type": ft(f.get("缺口责任类型")),
+            "result": ft(f.get("处理结果")),
+            "owner": ft(f.get("责任人")),
+            "detail": ft(f.get("缺口说明")) or ft(f.get("证据")),
+        })
+    return rows
+
+
+def _company_finance_audit_text(T, run_id, fields, report_summary):
+    gaps = _company_gap_rows(T, run_id)
+    open_p0 = [g for g in gaps if g["level"] == "P0" and g["result"] not in ("已补件", "确认例外", "已关闭")]
+    exceptions = [g for g in gaps if g["level"] == "P0" and g["result"] == "确认例外"]
+    summary = report_summary.get("summary") or {}
+    lines = []
+    if open_p0:
+        lines.append(f"**AI初审：还有 {len(open_p0)} 个 P0 缺口未处理，不能终审通过。**")
+        for g in open_p0[:3]:
+            lines.append(f"- {GAP_TYPE_LABELS.get(g['type'], g['type'] or '缺口')}：{g['detail'][:80]}")
+    elif exceptions:
+        lines.append(f"**AI初审：P0 已确认例外 {len(exceptions)} 项，可以交财务判断是否接受例外。**")
+        for g in exceptions[:3]:
+            lines.append(f"- 例外：{g['detail'][:80]}")
+    elif summary.get("cm_n"):
+        lines.append(f"**AI初审：发现 {int(summary.get('cm_n') or 0)} 个成本缺口，涉及销售 {_company_money(summary.get('cm_amt'))}。**")
+    elif report_summary.get("ok"):
+        lines.append("**AI初审：未发现 P0 成本、物流或口径缺口。**")
+    else:
+        lines.append(f"**AI初审：暂时无法自动读取摘要。** 原因：{report_summary.get('reason') or '-'}")
+    blocker_type = _company_label(GAP_TYPE_LABELS, fields.get("缺口责任类型"))
+    blocker = ft(fields.get("当前阻断方"))
+    if blocker_type != "-" or blocker not in ("", "-", "财务部"):
+        lines.append(f"当前阻断信息：{blocker_type} / {blocker or '-'}")
+    return "\n".join(lines)
+
+
+def _company_finance_focus_text(report_summary):
+    summary = report_summary.get("summary") or {}
+    focus = [
+        "请重点核对销售额、退款/退货、平台费/广告费、采购成本、物流成本和毛利率。",
+        "如果存在未入账成本、特殊物流口径、异常退款或本月例外处理，请点“退回补缺口”。",
+    ]
+    if summary.get("sales", 0) <= 0 and report_summary.get("ok"):
+        focus.insert(0, "这份报表销售额为 0，请确认本月是否确实无销售。")
+    if summary.get("cm_n"):
+        focus.insert(0, "报表仍有成本缺口，原则上不应终审通过，除非财务确认本月按例外处理。")
+    return "\n".join(f"- {x}" for x in focus)
+
+
 def _company_processed_card(title, message, ok=True, details=None):
     details = details or {}
     elements = [_company_md(message)]
@@ -1158,7 +1305,7 @@ def _company_gap_card(run, gap, *, test_mode=False):
     ])
 
 
-def _company_finance_card(run, *, test_mode=False, test_note=None):
+def _company_finance_card(T, run, *, test_mode=False, test_note=None):
     rf = run.get("fields", {})
     run_id = ft(rf.get("run_id"))
     period = ft(rf.get("期间"))
@@ -1169,6 +1316,8 @@ def _company_finance_card(run, *, test_mode=False, test_note=None):
     card_id = _company_card_id("finance_confirm", run_id, platform)
     nonce = str(_now_ms())
     note = (test_note or "测试卡，仅发给 Frankie；不会通知财务。") if test_mode else "请确认后再点击，处理结果会自动更新在这张卡片上。"
+    report_summary = _company_report_summary(T, rf)
+    summary = report_summary.get("summary") or {}
     elements = [
         _company_fields([
             ("渠道", platform),
@@ -1177,10 +1326,29 @@ def _company_finance_card(run, *, test_mode=False, test_note=None):
             ("目前状态", ft(rf.get("报表状态"))),
         ]),
         {"tag": "hr"},
-        _company_md(
-            "请财务确认：这份毛利报表是否可以作为本月最终版本。\n\n"
-            "如果还有成本、物流或口径问题没处理完，系统会自动拦住，不会进入公司总毛利表。"
-        ),
+        _company_md("请财务确认：这份毛利报表是否可以作为本月最终版本。"),
+        {"tag": "hr"},
+    ]
+    if report_summary.get("ok"):
+        elements += [
+            _company_fields([
+                ("销售额", _company_money(summary.get("sales"))),
+                ("毛利润", _company_money(summary.get("margin"))),
+                ("毛利率", _company_pct(summary.get("gross_margin"))),
+                ("采购成本", _company_money(summary.get("cost"))),
+                ("物流成本", _company_money(summary.get("freight"))),
+                ("广告/平台费", _company_money((summary.get("ad") or 0) + (summary.get("pf") or 0))),
+                ("销量", _fmt(summary.get("qty") or 0)),
+                ("明细行数", report_summary.get("rows") if report_summary.get("rows") is not None else "-"),
+            ]),
+            {"tag": "hr"},
+        ]
+    else:
+        elements += [_company_md(f"**报表数据摘要**\n暂时没有读到摘要：{report_summary.get('reason') or '-'}"), {"tag": "hr"}]
+    elements += [
+        _company_md(_company_finance_audit_text(T, run_id, rf, report_summary)),
+        {"tag": "hr"},
+        _company_md("**财务重点看这里**\n" + _company_finance_focus_text(report_summary)),
         {"tag": "hr"},
     ]
     if report_link:
@@ -1480,7 +1648,7 @@ async def profit_workflow_test_cards(request: Request):
                                             "最后动作": "send_finance_test_card"})
             run = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or run
         test_note = "测试卡，仅发给 Frankie、吴晓丹和财务部；不会影响真实报表。" if recipient_mode == "finance_gray" else None
-        cards["finance"] = _company_finance_card(run, test_mode=True, test_note=test_note)
+        cards["finance"] = _company_finance_card(T, run, test_mode=True, test_note=test_note)
 
     sent = {}
     if send:
