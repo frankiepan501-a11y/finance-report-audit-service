@@ -38,7 +38,7 @@ COMPANY_AUDIT_TBL = os.environ.get("COMPANY_PROFIT_AUDIT_TABLE_ID", "tblVan2P6bs
 DOMESTIC_ECOM_TASK_APP = os.environ.get("DOMESTIC_ECOM_TASK_APP_TOKEN", "IKyGb1jydaZW7msBzAicViiWngg")
 DOMESTIC_ECOM_TASK_TBL = os.environ.get("DOMESTIC_ECOM_TASK_TABLE_ID", "tblMYHXRHZ0GaqMh")
 COMPANY_CARD_SCHEMA = "company_profit_card_v3"
-COMPANY_CARD_TEMPLATE_VERSION = "v4-finance-summary-permission"
+COMPANY_CARD_TEMPLATE_VERSION = "v5-owner-gap-dispatch"
 FUNLABSWITCH_SHOPIFY_CUTOFF = "2026-07"
 COMPANY_CALLBACK_SEND_NEXT = os.environ.get("COMPANY_CALLBACK_SEND_NEXT", "false").lower() == "true"
 COMPANY_GENERATOR_ENABLED = os.environ.get("COMPANY_GENERATOR_ENABLED", "false").lower() == "true"
@@ -432,6 +432,34 @@ def _union_id_for_open_id(T, open_id):
     return ft(_contact_user(T, open_id).get("union_id"))
 
 
+def _company_find_open_id_by_name(T, name):
+    name = ft(name).strip()
+    if not name:
+        return ""
+    if name in COMPANY_OPERATOR_OPEN_ID_BY_NAME:
+        return COMPANY_OPERATOR_OPEN_ID_BY_NAME[name]
+    for did in (DEPT_XB, DEPT_ZW, DEPT_GN, FIN_DEPT):
+        try:
+            members = _dept_members(T, did)
+            for oid, nm in members.items():
+                if nm == name:
+                    return oid
+        except Exception:
+            continue
+    return ""
+
+
+def _company_recipient_by_name(T, name):
+    clean = ft(name).strip()
+    oid = _company_find_open_id_by_name(T, clean)
+    if not oid:
+        return None
+    union_id = _union_id_for_open_id(T, oid)
+    if not union_id:
+        return None
+    return {"name": clean, "open_id": oid, "union_id": union_id}
+
+
 # ===== 渠道负责人按职务实时解析(铁律①第3类: 对应渠道运营负责人也自动获权) =====
 DEPT_XB = "od-a69452a48133671d028ac82491c65a9f"   # 跨境电商平台部(亚马逊/美客多)
 DEPT_ZW = "od-5fdbfdf97a0f9c1305c42f39fb729125"   # 站外运营部(TikTok/独立站)
@@ -455,6 +483,16 @@ CHANNEL_OWNER_FIXED = {
     "速卖通毛利报表": ["ou_274ee5199a763b7ec97980cd54e3fecb"],   # 赵伟俊
 }
 _dept_jt_cache = {}
+
+# 运营缺口卡需要按报表里的 Listing负责人 精准发人。优先用通讯录实时取 union_id；
+# 这里保留常用姓名的 open_id 兜底，避免卡片分派因搜索接口波动中断。
+COMPANY_OPERATOR_OPEN_ID_BY_NAME = {
+    "黄奕纯": "ou_1b981067ce8edfd82af7c70c109310e4",
+    "陈翔宇": "ou_9c322382284a7a6672a091b9f4c0a551",
+    "余培霓": "ou_40ff10b05fc358f88c5674f053665551",
+    "林明坚": "ou_35aa6883c0598bac5c7e06fcb06f7c4d",
+    "赵伟俊": "ou_274ee5199a763b7ec97980cd54e3fecb",
+}
 
 
 def _dept_users_jt(T, did):
@@ -983,8 +1021,11 @@ def _company_seed_run(T, period, platform_id, *, override=None, report_period=No
     return _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or {"fields": fields}
 
 
-def _company_create_gap(T, run_id, period, platform, gap_type, detail, *, p_level="P0", owner=""):
+def _company_create_gap(T, run_id, period, platform, gap_type, detail, *, p_level="P0", owner="", payload_extra=None):
     gap_id = "gap_" + hashlib.sha1(f"{run_id}:{gap_type}:{detail}".encode("utf-8")).hexdigest()[:14]
+    payload = {"run_id": run_id, "gap_type": gap_type, "detail": detail}
+    if payload_extra:
+        payload.update(payload_extra)
     fields = {
         "gap_id": gap_id,
         "run_id": run_id,
@@ -999,7 +1040,7 @@ def _company_create_gap(T, run_id, period, platform, gap_type, detail, *, p_leve
         "是否可进财务终审": "false",
         "最后动作": "create_gap",
         "最后动作时间": str(_now_ms()),
-        "payload_json": _compact_json({"run_id": run_id, "gap_type": gap_type, "detail": detail}),
+        "payload_json": _compact_json(payload),
     }
     _bt_write(T, COMPANY_GAP_TBL, fields, "gap_id")
     return _bt_find(T, COMPANY_GAP_TBL, "gap_id", gap_id) or {"fields": fields}
@@ -1501,6 +1542,7 @@ def _company_cost_gap_details_from_sheet(T, token, ptype, limit=30):
     rows = vals[1:]
     c = {
         "owner": colidx(hdr, "Listing负责人") or colidx(hdr, "负责人"),
+        "country": colexact(hdr, "国家") or colidx(hdr, "国家"),
         "shop": colexact(hdr, "店铺") or colidx(hdr, "店铺"),
         "msku": colidx(hdr, "MSKU") or colexact(hdr, "SKU") or colidx(hdr, "SKU"),
         "name": colidx(hdr, "中文名称") or colidx(hdr, "商品名称") or colidx(hdr, "品名"),
@@ -1511,6 +1553,12 @@ def _company_cost_gap_details_from_sheet(T, token, ptype, limit=30):
         "margin": colidx(hdr, "毛利润", "RMB") or colidx(hdr, "毛利额"),
         "netqty": colidx(hdr, "净销量"),
         "netsales": colidx(hdr, "净销售额"),
+        "local_sku": colidx(hdr, "local_sku") or colidx(hdr, "ERP SKU"),
+        "profit_cg": colidx(hdr, "利润报表cgPriceTotal"),
+        "product_cg": colidx(hdr, "产品成本cg_price"),
+        "erp_name": colidx(hdr, "ERP品名"),
+        "cost_source": colidx(hdr, "成本来源"),
+        "diagnosis": colidx(hdr, "诊断结论"),
     }
 
     def g(row, key):
@@ -1535,6 +1583,7 @@ def _company_cost_gap_details_from_sheet(T, token, ptype, limit=30):
             continue
         details.append({
             "row": idx,
+            "country": txt(row, "country"),
             "shop": txt(row, "shop"),
             "msku": txt(row, "msku"),
             "name": txt(row, "name"),
@@ -1544,6 +1593,12 @@ def _company_cost_gap_details_from_sheet(T, token, ptype, limit=30):
             "purchase_cost_rmb": round(g(row, "cost"), 2),
             "freight_rmb": round(g(row, "freight"), 2),
             "margin_rmb": round(g(row, "margin"), 2),
+            "local_sku": txt(row, "local_sku"),
+            "profit_cg_price_total": round(g(row, "profit_cg"), 4),
+            "product_cg_price": round(g(row, "product_cg"), 4),
+            "erp_name": txt(row, "erp_name"),
+            "cost_source": txt(row, "cost_source"),
+            "diagnosis": txt(row, "diagnosis"),
         })
     return sorted(details, key=lambda x: -x["sales_rmb"])[:limit]
 
@@ -1582,7 +1637,7 @@ def _company_report_summary(T, fields):
         a["gross_margin"] = (a.get("margin", 0) / a.get("sales", 0)) if a.get("sales") else 0
         result.update({"ok": True, "summary": a, "field": fld, "shop": shop,
                        "rows": _company_sheet_row_count(T, token, ptype),
-                       "gap_details": _company_cost_gap_details_from_sheet(T, token, ptype) if token else []})
+                       "gap_details": _company_cost_gap_details_from_sheet(T, token, ptype, limit=200) if token else []})
         return result
     except Exception as e:
         result["reason"] = str(e)[:120]
@@ -1660,14 +1715,16 @@ def _company_gap_detail_text(report_summary):
     total = int((report_summary.get("summary") or {}).get("cm_n") or len(details))
     lines = [f"**具体成本缺口（共 {total} 条，按销售额从高到低）**",
              "行号=打开报表后左侧行号；财务可按行号或 MSKU 直接核对。"]
-    for i, g in enumerate(details, start=1):
+    shown = details[:20]
+    for i, g in enumerate(shown, start=1):
         name = f"｜{g['name']}" if g.get("name") else ""
         owner = g.get("owner") or "-"
         shop = g.get("shop") or "-"
         msku = g.get("msku") or "-"
-        lines.append(f"{i}. 行{g['row']}｜{shop}｜{msku}{name}｜{owner}｜销售 {_company_money(g.get('sales_rmb'))}｜采购成本 0")
-    if total > len(details):
-        lines.append(f"还有 {total - len(details)} 条未在卡片展开，请在报表中筛选采购成本=0。")
+        source = f"｜{g.get('cost_source')}" if g.get("cost_source") else ""
+        lines.append(f"{i}. 行{g['row']}｜{shop}｜{msku}{name}｜{owner}｜销售 {_company_money(g.get('sales_rmb'))}｜采购成本 0{source}")
+    if total > len(shown):
+        lines.append(f"还有 {total - len(shown)} 条未在卡片展开，请在报表中筛选采购成本=0。")
     return "\n".join(lines)
 
 
@@ -1680,6 +1737,106 @@ def _company_finance_block_reason(T, run_id, report_summary):
     if cm_n > 0:
         return f"AI 初审发现 {cm_n} 个采购成本缺口，涉及销售 {_company_money(summary.get('cm_amt'))}。成本补齐或确认例外前，不能终审通过。"
     return ""
+
+
+def _company_gap_payload(fields):
+    try:
+        return json.loads(ft((fields or {}).get("payload_json")) or "{}")
+    except Exception:
+        return {}
+
+
+def _company_owner_gap_instruction(details):
+    sources = {ft(g.get("cost_source")) for g in details}
+    lines = []
+    if "Listing未配对ERP SKU" in sources:
+        lines += [
+            "**需要你处理：补配 ERP SKU**",
+            "1. 打开领星 Amazon Listing / SKU 配对页面。",
+            "2. 按卡片里的 MSKU 搜索对应 Listing。",
+            "3. 把 `local_sku / ERP SKU` 绑定到正确的领星 ERP SKU。",
+            "4. 不确定 SKU 时，先核对产品库或找采购确认；不要用临时成本或随便配一个 SKU。",
+        ]
+    if "产品cg_price存在但利润报表为0" in sources:
+        lines += [
+            "**需要你核实：利润报表成本没有带出来**",
+            "这些行已经配到 ERP SKU，产品成本也存在，不是让你补产品成本。",
+            "请在领星利润报表里重新同步/重算成本；如果重算后仍为 0，先不要点通过，反馈给 AI/财务排查利润报表分摊。",
+        ]
+    if not lines:
+        lines += [
+            "**需要你处理：毛利报表成本缺口**",
+            "请按报表里的诊断结论补齐 SKU 配对、产品成本或利润报表成本同步，再回到卡片点击确认。",
+        ]
+    lines.append("全部处理完以后，再点卡片按钮；系统会自动重新生成并初审，不需要你去 Base 手动改状态。")
+    return "\n".join(lines)
+
+
+def _company_owner_gap_detail_text(owner, details):
+    total_sales = sum(float(g.get("sales_rmb") or 0) for g in details)
+    lines = [
+        f"AI 初审把 **{len(details)} 条**成本缺口定位到 **{owner or '待确认负责人'}**，涉及销售 {_company_money(total_sales)}。",
+        "请按下面行号和 MSKU 逐条处理：",
+    ]
+    for i, g in enumerate(details[:20], start=1):
+        sku = g.get("local_sku") or "未配对"
+        product_cg = g.get("product_cg_price")
+        cg_txt = "-" if product_cg in ("", None) else str(product_cg)
+        src = g.get("cost_source") or g.get("diagnosis") or "待诊断"
+        name = f"｜{g.get('name')}" if g.get("name") else ""
+        country = f"｜{g.get('country')}" if g.get("country") else ""
+        lines.append(
+            f"{i}. 行{g.get('row')}｜{g.get('shop') or '-'}{country}｜{g.get('msku') or '-'}{name}"
+            f"｜ERP SKU: {sku}｜产品cg_price: {cg_txt}｜{src}"
+        )
+    if len(details) > 20:
+        lines.append(f"还有 {len(details) - 20} 条未在卡片展开，请打开报表筛选你的负责人和采购成本=0。")
+    lines += ["", _company_owner_gap_instruction(details)]
+    return "\n".join(lines)
+
+
+def _company_sync_owner_cost_gaps(T, run, report_summary, *, source_action="audit_gate"):
+    fields = (run or {}).get("fields", {})
+    run_id = ft(fields.get("run_id"))
+    if not run_id:
+        return []
+    details = report_summary.get("gap_details") or []
+    if not details:
+        return []
+    period = ft(fields.get("期间"))
+    ident = _company_meta_from_run(fields)
+    grouped = defaultdict(list)
+    for item in details:
+        owner = ft(item.get("owner")) or "待确认负责人"
+        grouped[owner].append(item)
+    current_gap_ids = set()
+    created = []
+    for owner, rows in sorted(grouped.items(), key=lambda kv: (-sum(float(x.get("sales_rmb") or 0) for x in kv[1]), kv[0])):
+        detail = _company_owner_gap_detail_text(owner, rows)
+        gap = _company_create_gap(
+            T, run_id, period, ident["channel"], "master_data_gap", detail,
+            p_level="P0", owner=owner,
+            payload_extra={"subtype": "owner_cost_gap", "owner": owner, "details": rows, "source_action": source_action},
+        )
+        gid = ft((gap.get("fields") or {}).get("gap_id"))
+        if gid:
+            current_gap_ids.add(gid)
+        created.append(gap)
+
+    for rec in _bitable_all(T, IDX_APP, COMPANY_GAP_TBL):
+        f = rec.get("fields", {})
+        if ft(f.get("run_id")) != run_id:
+            continue
+        if ft(f.get("P级")) != "P0" or ft(f.get("处理结果")) not in ("", "待处理"):
+            continue
+        payload = _company_gap_payload(f)
+        gap_id = ft(f.get("gap_id"))
+        detail = ft(f.get("缺口说明"))
+        is_owner_gap = payload.get("subtype") == "owner_cost_gap"
+        is_summary_gap = payload.get("subtype") == "summary_cost_gap" or ("AI初审发现" in detail and "采购成本缺口" in detail)
+        if (is_owner_gap and gap_id not in current_gap_ids) or is_summary_gap:
+            _company_update_gap(T, gap_id, {"处理结果": "已关闭", "最后动作": f"{source_action}_split_to_owner_gaps"})
+    return created
 
 
 def _company_apply_report_audit_gate(T, run, *, source_action="finance_card_report"):
@@ -1695,11 +1852,14 @@ def _company_apply_report_audit_gate(T, run, *, source_action="finance_card_repo
     period = ft(fields.get("期间"))
     ident = _company_meta_from_run(fields)
     detail = f"AI初审发现 {cm_n} 个采购成本缺口，涉及销售 {_company_money(summary.get('cm_amt'))}。成本补齐或确认例外前不能进入财务终审。"
-    gap_detail_text = _company_gap_detail_text(report_summary)
-    if gap_detail_text:
-        detail += "\n\n" + gap_detail_text
-    _company_create_gap(T, run_id, period, ident["channel"], "master_data_gap", detail,
-                        p_level="P0", owner="采购/负责人")
+    owner_gaps = _company_sync_owner_cost_gaps(T, run, report_summary, source_action=source_action)
+    if not owner_gaps:
+        gap_detail_text = _company_gap_detail_text(report_summary)
+        if gap_detail_text:
+            detail += "\n\n" + gap_detail_text
+        _company_create_gap(T, run_id, period, ident["channel"], "master_data_gap", detail,
+                            p_level="P0", owner="采购/负责人",
+                            payload_extra={"subtype": "summary_cost_gap", "source_action": source_action})
     _company_update_run(T, run_id, {"报表状态": "P0待处理", "当前阻断方": "采购/负责人",
                                     "缺口责任类型": "master_data_gap",
                                     "P0数量": str(_company_open_p0_count(T, run_id)),
@@ -1831,6 +1991,46 @@ def _company_send_workflow_card(T, run, card_name, card, recipient_mode):
         if mid:
             _append_company_message_id(T, run_id, mid)
         sent.append({"to": recipient["name"], "code": res.get("code"), "message_id": mid})
+    return sent
+
+
+def _company_owner_gap_records(T, run_id):
+    rows = []
+    for rec in _bitable_all(T, IDX_APP, COMPANY_GAP_TBL):
+        f = rec.get("fields", {})
+        if ft(f.get("run_id")) != run_id:
+            continue
+        if ft(f.get("P级")) != "P0" or ft(f.get("处理结果")) not in ("", "待处理"):
+            continue
+        payload = _company_gap_payload(f)
+        if payload.get("subtype") == "owner_cost_gap":
+            rows.append(rec)
+    return rows
+
+
+def _company_send_owner_gap_cards(T, run, *, recipient_mode="frankie"):
+    run_id = ft((run or {}).get("fields", {}).get("run_id"))
+    ET = event_tok()
+    sent = []
+    for gap in _company_owner_gap_records(T, run_id):
+        gf = gap.get("fields", {})
+        owner = ft(gf.get("责任人")) or "待确认负责人"
+        card = _company_owner_gap_card(run, gap, test_mode=(recipient_mode != "owners"))
+        if recipient_mode == "owners":
+            recipient = _company_recipient_by_name(T, owner)
+            recipients = [recipient] if recipient else []
+        else:
+            recipients = [{"name": f"Frankie(代{owner})", "union_id": FRANKIE_UNION_ID}]
+        if not recipients:
+            sent.append({"owner": owner, "gap_id": ft(gf.get("gap_id")), "code": "no_recipient", "message_id": None})
+            continue
+        for recipient in recipients:
+            res = _send_event_card_union(ET, recipient["union_id"], card)
+            mid = (res.get("data") or {}).get("message_id")
+            if mid:
+                _append_company_message_id(T, run_id, mid)
+            sent.append({"owner": owner, "to": recipient["name"], "gap_id": ft(gf.get("gap_id")),
+                         "code": res.get("code"), "message_id": mid})
     return sent
 
 
@@ -1967,6 +2167,43 @@ def _company_gap_card(run, gap, *, test_mode=False):
                             _company_payload("company_profit_gap_exception", run_id, "p0_gap", card_id,
                                              gap_id=gap_id, platform=platform, period=period,
                                              decision="exception", nonce=nonce)),
+        ]},
+        _company_note(note),
+    ])
+
+
+def _company_owner_gap_card(run, gap, *, test_mode=False):
+    rf = run.get("fields", {})
+    gf = gap.get("fields", {})
+    run_id = ft(rf.get("run_id"))
+    gap_id = ft(gf.get("gap_id"))
+    period = ft(rf.get("期间")) or ft(gf.get("期间"))
+    ident = _company_meta_from_run(rf)
+    platform = ident["channel"]
+    site = ident["site"]
+    owner = ft(gf.get("责任人")) or "待确认负责人"
+    detail = ft(gf.get("缺口说明")) or ft(gf.get("证据"))
+    card_id = _company_card_id("owner_gap", run_id, gap_id)
+    nonce = str(_now_ms())
+    note = "测试卡，仅发给 Frankie；不会通知运营。" if test_mode else "处理完再点击；系统会自动重跑并再次初审。"
+    return _company_base_card("🔴 [FIN·P0] 毛利缺口需处理", "red", [
+        _company_fields([
+            ("渠道", platform),
+            ("站点/店铺", site),
+            ("月份", _company_period_label(period)),
+            ("需要处理的人", owner),
+        ]),
+        {"tag": "hr"},
+        _company_md(detail or "这份报表里有商品成本还没补齐，毛利会算不准。"),
+        {"tag": "hr"},
+        _company_md("成本问题处理前，这份报表不会交给财务做最终确认，也不会写入公司总毛利表。"),
+        {"tag": "hr"},
+        {"tag": "action", "actions": [
+            _company_button("我已处理，重跑初审",
+                            _company_payload("company_profit_gap_resolved", run_id, "owner_gap", card_id,
+                                             gap_id=gap_id, platform=platform, period=period,
+                                             decision="owner_resolved", nonce=nonce),
+                            "primary"),
         ]},
         _company_note(note),
     ])
@@ -2190,6 +2427,7 @@ def _handle_company_callback(body):
     run_id = str(value.get("run_id") or "")
     gap_id = str(value.get("gap_id") or "")
     idempotency_key = str(value.get("idempotency_key") or _payload_hash(value))
+    card_type = str(value.get("card_type") or "")
     if _company_audit_exists(T, idempotency_key):
         current_run = (_bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or {}).get("fields", {})
         current_gap = (_bt_find(T, COMPANY_GAP_TBL, "gap_id", gap_id) or {}).get("fields", {}) if gap_id else {}
@@ -2217,12 +2455,13 @@ def _handle_company_callback(body):
                                         "P0数量": str(_company_open_p0_count(T, run_id)), "最后动作": action})
         rerun = _company_rerun_run(T, run_id, send_next=COMPANY_CALLBACK_SEND_NEXT,
                                    recipient_mode="frankie", source_action="gap_resolved_callback")
+        prefix = "已记录：这批缺口已处理。" if card_type == "owner_gap" else "已记录：成本已补齐。"
         if rerun.get("status") == "finance_ready":
-            result_message = "已记录：成本已补齐。系统已重新初审，当前没有未处理 P0，已进入待财务终审。"
+            result_message = f"{prefix} 系统已重新初审，当前没有未处理 P0，已进入待财务终审。"
         elif rerun.get("open_p0"):
-            result_message = f"已记录：成本已补齐，并已重新初审；当前仍有 {rerun.get('open_p0')} 个 P0 需要继续处理。"
+            result_message = f"{prefix} 系统已重新初审；当前仍有 {rerun.get('open_p0')} 个 P0 需要继续处理。"
         else:
-            result_message = "已记录：成本已补齐，并已触发重新初审。"
+            result_message = f"{prefix} 系统已触发重新初审。"
     elif action == "company_profit_gap_exception":
         target_type, target_id = "gap", gap_id
         _company_update_gap(T, gap_id, {"处理结果": "确认例外", "是否可进财务终审": "true",
@@ -2493,6 +2732,50 @@ async def profit_workflow_rerun(request: Request):
                           "type": ((result.get("generator") or {}).get("generator") or {}).get("type"),
                           "workflow_id": ((result.get("generator") or {}).get("generator") or {}).get("workflow_id")},
             "message": result.get("message"),
+            "ledger": {"run_table": COMPANY_RUN_TBL, "gap_table": COMPANY_GAP_TBL, "audit_table": COMPANY_AUDIT_TBL}}
+
+
+@app.post("/profit-workflow/owner-gap-cards")
+async def profit_workflow_owner_gap_cards(request: Request):
+    """Split P0 cost gaps by report owner and optionally send operation cards."""
+    if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
+        raise HTTPException(401, "unauthorized")
+    q = request.query_params
+    run_id = q.get("run_id")
+    period = q.get("period") or _last_month()
+    report_period = q.get("report_period")
+    platform_id = q.get("platform") or "amazon"
+    recipient_mode = q.get("recipient_mode") or "frankie"
+    if recipient_mode not in ("frankie", "owners"):
+        raise HTTPException(400, "recipient_mode must be frankie or owners")
+    send = q.get("send") == "true"
+    include_cards = q.get("include_cards") == "true"
+    T = tok()
+    run = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) if run_id else None
+    if not run:
+        run = _company_seed_run(T, period, platform_id, report_period=report_period)
+        run_id = ft((run or {}).get("fields", {}).get("run_id"))
+    run = _company_refresh_report_link(T, run)
+    before = {"run": (run or {}).get("fields", {})}
+    run = _company_apply_report_audit_gate(T, run, source_action="owner_gap_cards")
+    run_id = ft((run or {}).get("fields", {}).get("run_id")) or run_id
+    owner_gaps = _company_owner_gap_records(T, run_id)
+    sent = _company_send_owner_gap_cards(T, run, recipient_mode=recipient_mode) if send else []
+    after = {"run": (run or {}).get("fields", {}), "owner_gap_count": len(owner_gaps), "sent": sent}
+    _company_write_system_audit(T, "owner_gap_cards", run_id, before, after,
+                                {"recipient_mode": recipient_mode, "send": send}, "ok")
+    cards = {}
+    if include_cards:
+        for gap in owner_gaps:
+            owner = ft((gap.get("fields") or {}).get("责任人")) or "待确认负责人"
+            cards[owner] = _company_owner_gap_card(run, gap, test_mode=(recipient_mode != "owners"))
+    return {"run_id": run_id, "period": ft((run.get("fields") or {}).get("期间")),
+            "platform": platform_id, "recipient_mode": recipient_mode, "send": send,
+            "owner_gap_count": len(owner_gaps),
+            "open_p0": _company_open_p0_count(T, run_id),
+            "sent": sent,
+            "cards": cards if include_cards else {},
+            "card_template": {"schema": COMPANY_CARD_SCHEMA, "version": COMPANY_CARD_TEMPLATE_VERSION},
             "ledger": {"run_table": COMPANY_RUN_TBL, "gap_table": COMPANY_GAP_TBL, "audit_table": COMPANY_AUDIT_TBL}}
 
 
