@@ -1253,6 +1253,17 @@ def _company_finance_focus_text(report_summary):
     return "\n".join(f"- {x}" for x in focus)
 
 
+def _company_finance_block_reason(T, run_id, report_summary):
+    open_p0 = _company_open_p0_count(T, run_id)
+    if open_p0 > 0:
+        return f"还有 {open_p0} 个 P0 问题未处理，不能进入财务终审通过。"
+    summary = report_summary.get("summary") or {}
+    cm_n = int(summary.get("cm_n") or 0)
+    if cm_n > 0:
+        return f"AI 初审发现 {cm_n} 个采购成本缺口，涉及销售 {_company_money(summary.get('cm_amt'))}。成本补齐或确认例外前，不能终审通过。"
+    return ""
+
+
 def _company_processed_card(title, message, ok=True, details=None):
     details = details or {}
     elements = [_company_md(message)]
@@ -1318,6 +1329,7 @@ def _company_finance_card(T, run, *, test_mode=False, test_note=None):
     note = (test_note or "测试卡，仅发给 Frankie；不会通知财务。") if test_mode else "请确认后再点击，处理结果会自动更新在这张卡片上。"
     report_summary = _company_report_summary(T, rf)
     summary = report_summary.get("summary") or {}
+    block_reason = _company_finance_block_reason(T, run_id, report_summary)
     elements = [
         _company_fields([
             ("渠道", platform),
@@ -1358,6 +1370,19 @@ def _company_finance_card(T, run, *, test_mode=False, test_note=None):
         link_msg = "测试卡未绑定真实毛利报表链接，当前只验证收件、按钮和写回。" if test_mode else "当前卡片还没有绑定毛利报表链接，请先补链接后再确认。"
         elements.append(_company_md(link_msg))
         elements.append({"tag": "hr"})
+    if block_reason:
+        elements += [
+            _company_md("**当前不能终审通过**\n" + block_reason),
+            {"tag": "hr"},
+            {"tag": "action", "actions": [
+                _company_button("退回补缺口",
+                                _company_payload("company_profit_finance_return", run_id, "finance_confirm", card_id,
+                                                 platform=platform, period=period, decision="return_p0", nonce=nonce),
+                                "primary"),
+            ]},
+            _company_note(note),
+        ]
+        return _company_base_card("🔴 [FIN·P0] 毛利报表终审需先处理", "red", elements)
     elements += [
         {"tag": "action", "actions": [
             _company_button("终审通过",
@@ -1542,9 +1567,14 @@ def _handle_company_callback(body):
     elif action == "company_profit_finance_approve":
         open_p0 = _company_open_p0_count(T, run_id)
         before_run = before.get("run") or {}
+        report_summary = _company_report_summary(T, before_run)
+        block_reason = _company_finance_block_reason(T, run_id, report_summary)
         if open_p0 > 0:
             ok = False
             result_message = f"还有 {open_p0} 个关键问题没处理完，这次不能确认通过。"
+        elif block_reason:
+            ok = False
+            result_message = block_reason
         elif not _company_is_smoke_run(before_run, run_id) and not ft(before_run.get("报表链接")):
             ok = False
             result_message = "这张终审卡还没有绑定毛利报表链接，不能确认通过。"
