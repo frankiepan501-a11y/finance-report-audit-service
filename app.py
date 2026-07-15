@@ -436,16 +436,16 @@ def _company_find_open_id_by_name(T, name):
     name = ft(name).strip()
     if not name:
         return ""
-    if name in COMPANY_OPERATOR_OPEN_ID_BY_NAME:
-        return COMPANY_OPERATOR_OPEN_ID_BY_NAME[name]
     for did in (DEPT_XB, DEPT_ZW, DEPT_GN, FIN_DEPT):
         try:
             members = _dept_members(T, did)
             for oid, nm in members.items():
-                if nm == name:
+                if ft(nm).strip() == name:
                     return oid
         except Exception:
             continue
+    if name in COMPANY_OPERATOR_OPEN_ID_BY_NAME:
+        return COMPANY_OPERATOR_OPEN_ID_BY_NAME[name]
     return ""
 
 
@@ -487,11 +487,10 @@ _dept_jt_cache = {}
 # 运营缺口卡需要按报表里的 Listing负责人 精准发人。优先用通讯录实时取 union_id；
 # 这里保留常用姓名的 open_id 兜底，避免卡片分派因搜索接口波动中断。
 COMPANY_OPERATOR_OPEN_ID_BY_NAME = {
-    "黄奕纯": "ou_1b981067ce8edfd82af7c70c109310e4",
-    "陈翔宇": "ou_9c322382284a7a6672a091b9f4c0a551",
-    "余培霓": "ou_40ff10b05fc358f88c5674f053665551",
-    "林明坚": "ou_35aa6883c0598bac5c7e06fcb06f7c4d",
-    "赵伟俊": "ou_274ee5199a763b7ec97980cd54e3fecb",
+    "黄奕纯": "ou_3a80e361d1e8a1d23ead015b6a2a8369",
+    "陈翔宇": "ou_ed76cf4c789f13fda0921c3e8f6acf40",
+    "余培霓": "ou_59aa463ab360202b213480e9bae5ced1",
+    "林明坚": "ou_e1b96884de4085554369fe1d1c5a0aea",
 }
 
 
