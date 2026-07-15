@@ -37,6 +37,7 @@ COMPANY_GAP_TBL = os.environ.get("COMPANY_PROFIT_GAP_TABLE_ID", "tblvJaWomx25pAr
 COMPANY_AUDIT_TBL = os.environ.get("COMPANY_PROFIT_AUDIT_TABLE_ID", "tblVan2P6bsGb9em")
 COMPANY_CARD_SCHEMA = "company_profit_card_v3"
 COMPANY_CARD_TEMPLATE_VERSION = "v4-finance-summary-permission"
+COMPANY_CALLBACK_SEND_NEXT = os.environ.get("COMPANY_CALLBACK_SEND_NEXT", "false").lower() == "true"
 
 COMPANY_PLATFORM_REGISTRY = {
     "amazon": {"name": "Amazon", "platform": "亚马逊", "site": "亚马逊全站", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部"},
@@ -67,6 +68,11 @@ COMPANY_REPORT_FIELD_BY_PLATFORM = {
     "tiktok_shop": "TikTok Shop毛利报表",
     "temu": "TEMU毛利报表",
 }
+
+COMPANY_V1_PLATFORM_IDS = ["domestic_ecom", "mercadolibre", "amazon", "walmart", "funlab_net", "powkong"]
+COMPANY_P0_PLATFORM_IDS = ["funlabswitch"]
+COMPANY_P1_PLATFORM_IDS = ["aliexpress", "tiktok_shop", "b2b", "offline"]
+COMPANY_P2_PLATFORM_IDS = ["temu", "taobao", "pinduoduo"]
 
 
 def _tok_for(app_id, app_secret):
@@ -722,6 +728,14 @@ def _company_write_audit(T, idempotency_key, action, actor_open_id, run_id, targ
     }, "idempotency_key")
 
 
+def _company_write_system_audit(T, action, run_id, before, after, payload, result, target_type="run", target_id=""):
+    key = hashlib.sha256(
+        f"system:{action}:{run_id}:{target_id or run_id}:{_now_ms()}:{_payload_hash(payload)}".encode("utf-8")
+    ).hexdigest()[:32]
+    _company_write_audit(T, key, action, "system", run_id, target_type, target_id or run_id,
+                         before, after, payload, result)
+
+
 def _sheet_vals(T, ss, prefer=None):
     H = {"Authorization": f"Bearer {T}"}
     sh = requests.get(f"{FEISHU}/sheets/v3/spreadsheets/{ss}/sheets/query", headers=H, timeout=30).json()
@@ -1374,6 +1388,138 @@ def _company_first_open_p0_gap(T, run_id):
     return None
 
 
+def _company_platform_ids(platform_param="", scope="v1"):
+    if platform_param:
+        ids = [p.strip() for p in str(platform_param).split(",") if p.strip()]
+    else:
+        scope = (scope or "v1").strip()
+        if scope == "all":
+            ids = list(COMPANY_PLATFORM_REGISTRY.keys())
+        elif scope == "p0":
+            ids = list(COMPANY_P0_PLATFORM_IDS)
+        elif scope == "p1":
+            ids = list(COMPANY_P1_PLATFORM_IDS)
+        elif scope == "p2":
+            ids = list(COMPANY_P2_PLATFORM_IDS)
+        elif scope == "ready":
+            ids = list(COMPANY_V1_PLATFORM_IDS)
+        else:
+            ids = list(COMPANY_V1_PLATFORM_IDS)
+    for pid in ids:
+        _company_platform(pid)
+    return ids
+
+
+def _company_missing_report_gap_type(meta):
+    mode = ft((meta or {}).get("data_mode"))
+    if mode == "api":
+        return "api_error", "AI自动化"
+    if mode == "manual":
+        return "source_file_gap", "平台负责人"
+    if mode == "ledger":
+        return "workflow_gap", "AI自动化"
+    if mode == "hybrid":
+        return "master_data_gap", "采购/负责人"
+    return "workflow_gap", "AI自动化"
+
+
+def _company_open_report_gap(T, run):
+    fields = (run or {}).get("fields", {})
+    run_id = ft(fields.get("run_id"))
+    if not run_id:
+        return run
+    payload = _company_run_payload(fields)
+    meta = payload.get("meta") or {}
+    platform_id = ft(payload.get("platform_id"))
+    period = ft(fields.get("期间"))
+    ident = _company_meta_from_run(fields)
+    gap_type, owner = _company_missing_report_gap_type(meta)
+    if platform_id in COMPANY_P1_PLATFORM_IDS + COMPANY_P2_PLATFORM_IDS:
+        detail = f"{ident['channel']} {period} 的毛利报表还没有接入统一生成、初审、终审和灌总表流程。"
+    else:
+        detail = f"{ident['channel']} {period} 没有绑定毛利报表链接，系统无法做 AI 初审或交给财务终审。"
+    _company_create_gap(T, run_id, period, ident["channel"], gap_type, detail, p_level="P0", owner=owner)
+    _company_update_run(T, run_id, {"报表状态": "P0待处理", "当前阻断方": owner,
+                                    "缺口责任类型": gap_type,
+                                    "P0数量": str(_company_open_p0_count(T, run_id)),
+                                    "最后动作": "report_link_missing_blocked"})
+    return _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or run
+
+
+def _company_audit_run_cycle(T, run, *, source_action="run_month"):
+    before = {"run": (run or {}).get("fields", {})}
+    fields = before["run"]
+    run_id = ft(fields.get("run_id"))
+    report_link = ft(fields.get("报表链接"))
+    if not run_id:
+        return {"ok": False, "run": run, "status": "invalid", "message": "run_id missing"}
+
+    _company_update_run(T, run_id, {"报表状态": "AI初审中", "当前阻断方": "AI自动化",
+                                    "最后动作": f"{source_action}_audit_started"})
+    run = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or run
+    if not report_link and not _company_is_smoke_run(fields, run_id):
+        run = _company_open_report_gap(T, run)
+        after = {"run": (run or {}).get("fields", {}), "open_p0": _company_open_p0_count(T, run_id)}
+        _company_write_system_audit(T, f"{source_action}_audit_blocked_no_report", run_id,
+                                    before, after, {"source_action": source_action}, "blocked")
+        return {"ok": False, "run": run, "status": "p0_gap", "open_p0": after["open_p0"],
+                "gap": _company_first_open_p0_gap(T, run_id), "message": "没有绑定毛利报表链接"}
+
+    run = _company_apply_report_audit_gate(T, run)
+    open_p0 = _company_open_p0_count(T, run_id)
+    if open_p0 == 0:
+        _company_update_run(T, run_id, {"报表状态": "待财务终审", "当前阻断方": "财务部",
+                                        "缺口责任类型": "", "P0数量": "0",
+                                        "最后动作": f"{source_action}_audit_passed"})
+        run = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or run
+        status, result, message = "finance_ready", "ok", "AI初审未发现未处理 P0，已进入待财务终审。"
+    else:
+        run = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or run
+        status, result, message = "p0_gap", "blocked", f"AI初审后仍有 {open_p0} 个 P0，不能进入财务终审。"
+    after = {"run": (run or {}).get("fields", {}), "open_p0": open_p0}
+    _company_write_system_audit(T, f"{source_action}_audit_cycle", run_id, before, after,
+                                {"source_action": source_action}, result)
+    return {"ok": open_p0 == 0, "run": run, "status": status, "open_p0": open_p0,
+            "gap": _company_first_open_p0_gap(T, run_id), "message": message}
+
+
+def _company_send_workflow_card(T, run, card_name, card, recipient_mode):
+    ET = event_tok()
+    run_id = ft((run or {}).get("fields", {}).get("run_id"))
+    recipients = _company_finance_card_recipients(T, "frankie" if card_name == "p0_gap" else recipient_mode)
+    sent = []
+    for recipient in recipients:
+        res = _send_event_card_union(ET, recipient["union_id"], card)
+        mid = (res.get("data") or {}).get("message_id")
+        if mid:
+            _append_company_message_id(T, run_id, mid)
+        sent.append({"to": recipient["name"], "code": res.get("code"), "message_id": mid})
+    return sent
+
+
+def _company_rerun_run(T, run_id, *, send_next=False, recipient_mode="frankie", source_action="rerun"):
+    run = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id)
+    if not run:
+        return {"ok": False, "status": "not_found", "message": f"run not found: {run_id}"}
+    _company_update_run(T, run_id, {"报表状态": "AI生成中", "当前阻断方": "AI自动化",
+                                    "最后动作": f"{source_action}_rerun_started"})
+    run = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or run
+    result = _company_audit_run_cycle(T, run, source_action=source_action)
+    run = result.get("run") or run
+    card_name = None
+    card = None
+    if result.get("status") == "finance_ready":
+        card_name = "finance"
+        card = _company_finance_card(T, run, test_mode=(recipient_mode == "frankie"),
+                                     test_note="Frankie-only 重跑验证卡；不会自动通知财务。" if recipient_mode == "frankie" else None)
+    elif result.get("gap"):
+        card_name = "p0_gap"
+        card = _company_gap_card(run, result["gap"], test_mode=(recipient_mode == "frankie"))
+    sent = _company_send_workflow_card(T, run, card_name, card, recipient_mode) if (send_next and card) else []
+    result.update({"next_card": card_name, "sent": sent})
+    return result
+
+
 def _company_processed_card(title, message, ok=True, details=None):
     details = details or {}
     elements = [_company_md(message)]
@@ -1669,7 +1815,14 @@ def _handle_company_callback(body):
                                         "来源message_id": ctx["message_id"], "最后动作": action})
         _company_update_run(T, run_id, {"报表状态": "待AI重跑", "当前阻断方": "AI自动化",
                                         "P0数量": str(_company_open_p0_count(T, run_id)), "最后动作": action})
-        result_message = "已记录：成本已补齐。系统会重新生成这份毛利报表。"
+        rerun = _company_rerun_run(T, run_id, send_next=COMPANY_CALLBACK_SEND_NEXT,
+                                   recipient_mode="frankie", source_action="gap_resolved_callback")
+        if rerun.get("status") == "finance_ready":
+            result_message = "已记录：成本已补齐。系统已重新初审，当前没有未处理 P0，已进入待财务终审。"
+        elif rerun.get("open_p0"):
+            result_message = f"已记录：成本已补齐，并已重新初审；当前仍有 {rerun.get('open_p0')} 个 P0 需要继续处理。"
+        else:
+            result_message = "已记录：成本已补齐，并已触发重新初审。"
     elif action == "company_profit_gap_exception":
         target_type, target_id = "gap", gap_id
         _company_update_gap(T, gap_id, {"处理结果": "确认例外", "是否可进财务终审": "true",
@@ -1755,6 +1908,91 @@ async def profit_workflow_seed(request: Request):
         rows.append({"platform": pid, "run_id": ft(rec.get("fields", {}).get("run_id")),
                      "record_id": rec.get("record_id")})
     return {"period": period, "seeded": rows, "run_table": COMPANY_RUN_TBL}
+
+
+@app.post("/profit-workflow/run-month")
+async def profit_workflow_run_month(request: Request):
+    """Production-oriented monthly orchestrator: seed runs, run AI initial audit, then route P0 or finance cards."""
+    if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
+        raise HTTPException(401, "unauthorized")
+    q = request.query_params
+    period = q.get("period") or _last_month()
+    report_period = q.get("report_period")
+    scope = q.get("scope") or "v1"
+    platform_param = q.get("platform") or ""
+    recipient_mode = q.get("recipient_mode") or "frankie"
+    send = q.get("send") == "true"
+    include_cards = q.get("include_cards") == "true"
+    if recipient_mode not in ("frankie", "finance_gray"):
+        raise HTTPException(400, "recipient_mode must be frankie or finance_gray")
+
+    T = tok()
+    platform_ids = _company_platform_ids(platform_param, scope)
+    results = []
+    cards = {}
+    for pid in platform_ids:
+        run = _company_seed_run(T, period, pid, report_period=report_period)
+        run_id = ft((run or {}).get("fields", {}).get("run_id"))
+        audit = _company_audit_run_cycle(T, run, source_action="run_month")
+        run = audit.get("run") or run
+        card_name = None
+        card = None
+        if audit.get("status") == "p0_gap":
+            gap = audit.get("gap")
+            if gap:
+                card_name = "p0_gap"
+                card = _company_gap_card(run, gap, test_mode=(recipient_mode == "frankie"))
+        elif audit.get("status") == "finance_ready":
+            card_name = "finance"
+            card = _company_finance_card(T, run, test_mode=(recipient_mode == "frankie"),
+                                         test_note="Frankie-only 月度编排测试卡；不会自动通知财务。" if recipient_mode == "frankie" else None)
+        sent = _company_send_workflow_card(T, run, card_name, card, recipient_mode) if (send and card) else []
+        if include_cards and card:
+            cards[pid] = card
+        results.append({
+            "platform": pid,
+            "run_id": run_id,
+            "status": audit.get("status"),
+            "open_p0": audit.get("open_p0", _company_open_p0_count(T, run_id)),
+            "next_card": card_name,
+            "message": audit.get("message"),
+            "sent": sent,
+            "report_link": ft((run.get("fields") or {}).get("报表链接")),
+        })
+    return {"period": period, "report_period": report_period or period, "scope": scope,
+            "platforms": platform_ids, "recipient_mode": recipient_mode,
+            "send": send, "results": results,
+            "card_template": {"schema": COMPANY_CARD_SCHEMA, "version": COMPANY_CARD_TEMPLATE_VERSION},
+            "cards": cards if include_cards else {},
+            "ledger": {"run_table": COMPANY_RUN_TBL, "gap_table": COMPANY_GAP_TBL, "audit_table": COMPANY_AUDIT_TBL}}
+
+
+@app.post("/profit-workflow/rerun")
+async def profit_workflow_rerun(request: Request):
+    """Rerun one company-profit run after P0补件/例外处理; optionally send the next Frankie-only/gray card."""
+    if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
+        raise HTTPException(401, "unauthorized")
+    q = request.query_params
+    run_id = q.get("run_id")
+    if not run_id:
+        period = q.get("period") or _last_month()
+        platform_id = q.get("platform")
+        if not platform_id:
+            raise HTTPException(400, "run_id or platform is required")
+        run_id = _company_run_id(period, platform_id)
+    recipient_mode = q.get("recipient_mode") or "frankie"
+    if recipient_mode not in ("frankie", "finance_gray"):
+        raise HTTPException(400, "recipient_mode must be frankie or finance_gray")
+    T = tok()
+    result = _company_rerun_run(T, run_id, send_next=q.get("send") == "true",
+                                recipient_mode=recipient_mode, source_action="manual_rerun")
+    if result.get("status") == "not_found":
+        raise HTTPException(404, result.get("message"))
+    return {"run_id": run_id, "recipient_mode": recipient_mode, "send": q.get("send") == "true",
+            "status": result.get("status"), "open_p0": result.get("open_p0"),
+            "next_card": result.get("next_card"), "sent": result.get("sent"),
+            "message": result.get("message"),
+            "ledger": {"run_table": COMPANY_RUN_TBL, "gap_table": COMPANY_GAP_TBL, "audit_table": COMPANY_AUDIT_TBL}}
 
 
 @app.post("/profit-workflow/test-cards")
