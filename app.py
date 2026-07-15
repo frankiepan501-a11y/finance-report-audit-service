@@ -1353,7 +1353,7 @@ def _company_finance_block_reason(T, run_id, report_summary):
     return ""
 
 
-def _company_apply_report_audit_gate(T, run):
+def _company_apply_report_audit_gate(T, run, *, source_action="finance_card_report"):
     fields = (run or {}).get("fields", {})
     run_id = ft(fields.get("run_id"))
     if not run_id:
@@ -1374,7 +1374,7 @@ def _company_apply_report_audit_gate(T, run):
     _company_update_run(T, run_id, {"报表状态": "P0待处理", "当前阻断方": "采购/负责人",
                                     "缺口责任类型": "master_data_gap",
                                     "P0数量": str(_company_open_p0_count(T, run_id)),
-                                    "最后动作": "finance_card_report_audit_blocked"})
+                                    "最后动作": f"{source_action}_audit_blocked"})
     return _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or run
 
 
@@ -1465,7 +1465,7 @@ def _company_audit_run_cycle(T, run, *, source_action="run_month"):
         return {"ok": False, "run": run, "status": "p0_gap", "open_p0": after["open_p0"],
                 "gap": _company_first_open_p0_gap(T, run_id), "message": "没有绑定毛利报表链接"}
 
-    run = _company_apply_report_audit_gate(T, run)
+    run = _company_apply_report_audit_gate(T, run, source_action=source_action)
     open_p0 = _company_open_p0_count(T, run_id)
     if open_p0 == 0:
         _company_update_run(T, run_id, {"报表状态": "待财务终审", "当前阻断方": "财务部",
