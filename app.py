@@ -3,7 +3,7 @@
 检查: 数据缺漏(空报表) / 采购成本覆盖(有销售但cg=0) / 物流头程覆盖。
 异常 → 飞书卡片发财务部 + Frankie, 列 渠道/店铺/负责人/异常, 让财务跟运营核实。
 口径: 只 flag「销售额>0 且 成本=0」(真异常); 销售=0的0成本行忽略。"""
-import os, json, datetime, hashlib, time
+import os, json, datetime, hashlib, time, re
 from collections import defaultdict
 import requests
 from fastapi import FastAPI, Request, HTTPException
@@ -39,6 +39,7 @@ DOMESTIC_ECOM_TASK_APP = os.environ.get("DOMESTIC_ECOM_TASK_APP_TOKEN", "IKyGb1j
 DOMESTIC_ECOM_TASK_TBL = os.environ.get("DOMESTIC_ECOM_TASK_TABLE_ID", "tblMYHXRHZ0GaqMh")
 COMPANY_CARD_SCHEMA = "company_profit_card_v3"
 COMPANY_CARD_TEMPLATE_VERSION = "v4-finance-summary-permission"
+FUNLABSWITCH_SHOPIFY_CUTOFF = "2026-07"
 COMPANY_CALLBACK_SEND_NEXT = os.environ.get("COMPANY_CALLBACK_SEND_NEXT", "false").lower() == "true"
 COMPANY_GENERATOR_ENABLED = os.environ.get("COMPANY_GENERATOR_ENABLED", "false").lower() == "true"
 COMPANY_GENERATOR_TIMEOUT = int(os.environ.get("COMPANY_GENERATOR_TIMEOUT", "30"))
@@ -60,7 +61,7 @@ COMPANY_PLATFORM_REGISTRY = {
     "funlab_net": {"name": "funlab.net", "platform": "独立站", "site": "funlab.net", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部", "maturity": "confirmed", "generator_type": "n8n_webhook", "workflow_id": "2q7WSFS5G9zQpfcN", "generator_method": "GET", "generator_path": "trigger-funlabnet-profit"},
     "powkong": {"name": "Powkong", "platform": "独立站", "site": "powkong.com", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部", "maturity": "confirmed", "generator_type": "n8n_webhook", "workflow_id": "rkG32295bx3dVcRh", "generator_method": "GET", "generator_path": "trigger-powkong-shopify-admin-profit"},
     "domestic_ecom": {"name": "国内电商", "platform": "国内电商", "site": "国内电商店铺组", "data_mode": "manual", "data_status": "资料已提交", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部", "maturity": "confirmed", "generator_type": "service_endpoint", "service_base_url": "https://domestic-ecom-profit.zeabur.app", "service_endpoint": "/profit/run", "generator_method": "POST", "auth_token_env": "DOMESTIC_ECOM_PROFIT_TOKEN", "generator_requires": "source_record_id", "generator_lookup": "domestic_summary_record", "generator_note": "按月份自动查国内电商任务台的月度报表汇总 record_id 后触发。"},
-    "funlabswitch": {"name": "funlabswitch.com", "platform": "独立站", "site": "funlabswitch.com", "data_mode": "hybrid", "data_status": "待成本维护", "report_status": "P0待处理", "blocker_type": "master_data_gap", "blocker": "采购/负责人", "maturity": "blocked", "generator_type": "n8n_webhook", "workflow_id": "s9u91925K049t7ud", "generator_method": "GET", "generator_path": "trigger-funlabswitch-profit"},
+    "funlabswitch": {"name": "funlabswitch.com", "platform": "独立站", "site": "funlabswitch.com", "data_mode": "hybrid", "data_status": "待成本维护", "report_status": "P0待处理", "blocker_type": "master_data_gap", "blocker": "采购/负责人", "maturity": "blocked", "generator_type": "n8n_webhook", "workflow_id": "s9u91925K049t7ud", "generator_method": "GET", "generator_path": "trigger-funlabswitch-profit", "generator_note": "2026-06 保留历史 Shopline/成本缺口收口；2026-07 起迁移 Shopify API，与 funlab.net/Powkong 统一。"},
     "aliexpress": {"name": "AliExpress", "platform": "速卖通", "site": "速卖通店铺组", "data_mode": "api", "data_status": "取数完成", "report_status": "待接统一终审", "blocker_type": "workflow_gap", "blocker": "AI自动化", "maturity": "partial", "generator_type": "n8n_webhook", "workflow_id": "eQBUjKcBr30zgBgy", "generator_method": "GET", "generator_path": "trigger-aliexpress-profit"},
     "tiktok_shop": {"name": "TikTok Shop", "platform": "TikTok Shop", "site": "TikTok Shop店铺组", "data_mode": "api", "data_status": "取数完成", "report_status": "待接统一终审", "blocker_type": "workflow_gap", "blocker": "AI自动化", "maturity": "partial", "generator_type": "n8n_webhook", "workflow_id": "Zw17LKlAL6W9TC0V", "generator_method": "GET", "generator_path": "trigger-tiktok-profit"},
     "b2b": {"name": "B2B", "platform": "B2B", "site": "B2B业务台账", "data_mode": "ledger", "data_status": "台账已就绪", "report_status": "待接台账模式", "blocker_type": "workflow_gap", "blocker": "AI自动化", "maturity": "partial", "generator_type": "ledger_service", "generator_note": "待补 B2B 台账完整性审计与总表触发。"},
@@ -602,6 +603,50 @@ def _company_platform(platform_id):
     return key, COMPANY_PLATFORM_REGISTRY[key]
 
 
+def _company_period_month(value):
+    raw = str(ft(value) or "")
+    m = re.search(r"(20\d{2})[-/](\d{1,2})", raw)
+    if not m:
+        return ""
+    month = int(m.group(2))
+    if month < 1 or month > 12:
+        return ""
+    return f"{m.group(1)}-{month:02d}"
+
+
+def _company_effective_report_month(period="", report_period=""):
+    return _company_period_month(report_period) or _company_period_month(period)
+
+
+def _company_funlabswitch_shopify_period(period="", report_period=""):
+    month = _company_effective_report_month(period, report_period)
+    return bool(month and month >= FUNLABSWITCH_SHOPIFY_CUTOFF)
+
+
+def _company_platform_meta(platform_id, *, period="", report_period=""):
+    key, base = _company_platform(platform_id)
+    meta = dict(base)
+    if key == "funlabswitch" and _company_funlabswitch_shopify_period(period, report_period):
+        meta.update({
+            "data_mode": "api",
+            "data_status": "取数完成",
+            "report_status": "待财务终审",
+            "blocker_type": "",
+            "blocker": "财务部",
+            "maturity": "confirmed",
+            "source_system": "Shopify Admin API",
+            "generator_family": "shopify_admin_api",
+            "generator_note": "2026-07 起 funlabswitch.com 迁移 Shopify，生成方式与 funlab.net/Powkong 统一；2026-06 仍保留历史 Shopline/成本缺口收口。",
+        })
+    return key, meta
+
+
+def _company_apply_period_registry_override(platform_id, meta, *, period="", report_period=""):
+    if platform_id == "funlabswitch" and _company_funlabswitch_shopify_period(period, report_period):
+        meta.update(_company_platform_meta(platform_id, period=period, report_period=report_period)[1])
+    return meta
+
+
 def _company_run_id(period, platform_id):
     return f"company-profit-{period}-{platform_id}"
 
@@ -659,9 +704,12 @@ def _company_generator_record_id(payload, *, T=None, fields=None, meta=None):
 def _company_generator_status(fields, T=None):
     payload = _company_run_payload(fields)
     platform_id = ft(payload.get("platform_id"))
-    registry_meta = COMPANY_PLATFORM_REGISTRY.get(platform_id, {})
+    period = ft((fields or {}).get("期间"))
+    report_period = ft(payload.get("report_period")) or period
+    registry_meta = _company_platform_meta(platform_id, period=period, report_period=report_period)[1] if platform_id else {}
     meta = dict(registry_meta)
     meta.update({k: v for k, v in (payload.get("meta") or {}).items() if v not in ("", None)})
+    meta = _company_apply_period_registry_override(platform_id, meta, period=period, report_period=report_period)
     gtype = ft(meta.get("generator_type"))
     url = _company_generator_url(meta)
     required = ft(meta.get("generator_requires"))
@@ -756,8 +804,9 @@ def _company_trigger_generator(T, run, *, source_action="rerun"):
     params = {"period": period, "month": report_period, "run_id": run_id, "source": source_action}
     headers = {}
     platform_id = ft(payload.get("platform_id"))
-    meta = dict(COMPANY_PLATFORM_REGISTRY.get(platform_id, {}))
+    meta = dict(_company_platform_meta(platform_id, period=period, report_period=report_period)[1] if platform_id else {})
     meta.update({k: v for k, v in (payload.get("meta") or {}).items() if v not in ("", None)})
+    meta = _company_apply_period_registry_override(platform_id, meta, period=period, report_period=report_period)
     auth_env = ft(meta.get("auth_token_env"))
     if auth_env and os.environ.get(auth_env):
         headers["Authorization"] = f"Bearer {os.environ[auth_env]}"
@@ -820,7 +869,7 @@ def _bt_write(T, tbl, fields, key_field=None):
 
 
 def _company_seed_run(T, period, platform_id, *, override=None, report_period=None):
-    platform_id, meta = _company_platform(platform_id)
+    platform_id, meta = _company_platform_meta(platform_id, period=period, report_period=report_period)
     run_id = _company_run_id(period, platform_id)
     report_link = _company_report_link(T, period, platform_id, report_period=report_period)
     fields = {
@@ -1576,23 +1625,28 @@ def _company_first_open_p0_gap(T, run_id):
     return None
 
 
-def _company_platform_ids(platform_param="", scope="v1"):
+def _company_platform_ids(platform_param="", scope="v1", *, period=""):
     if platform_param:
         ids = [p.strip() for p in str(platform_param).split(",") if p.strip()]
     else:
         scope = (scope or "v1").strip()
+        funlabswitch_is_ready = _company_funlabswitch_shopify_period(period)
         if scope == "all":
             ids = list(COMPANY_PLATFORM_REGISTRY.keys())
         elif scope == "p0":
-            ids = list(COMPANY_P0_PLATFORM_IDS)
+            ids = [pid for pid in COMPANY_P0_PLATFORM_IDS if not (pid == "funlabswitch" and funlabswitch_is_ready)]
         elif scope == "p1":
             ids = list(COMPANY_P1_PLATFORM_IDS)
         elif scope == "p2":
             ids = list(COMPANY_P2_PLATFORM_IDS)
         elif scope == "ready":
             ids = list(COMPANY_V1_PLATFORM_IDS)
+            if funlabswitch_is_ready and "funlabswitch" not in ids:
+                ids.append("funlabswitch")
         else:
             ids = list(COMPANY_V1_PLATFORM_IDS)
+            if funlabswitch_is_ready and "funlabswitch" not in ids:
+                ids.append("funlabswitch")
     for pid in ids:
         _company_platform(pid)
     return ids
@@ -1617,9 +1671,12 @@ def _company_open_report_gap(T, run):
     if not run_id:
         return run
     payload = _company_run_payload(fields)
-    meta = payload.get("meta") or {}
     platform_id = ft(payload.get("platform_id"))
     period = ft(fields.get("期间"))
+    report_period = ft(payload.get("report_period")) or period
+    meta = dict(_company_platform_meta(platform_id, period=period, report_period=report_period)[1] if platform_id else {})
+    meta.update({k: v for k, v in (payload.get("meta") or {}).items() if v not in ("", None)})
+    meta = _company_apply_period_registry_override(platform_id, meta, period=period, report_period=report_period)
     ident = _company_meta_from_run(fields)
     gap_type, owner = _company_missing_report_gap_type(meta)
     if platform_id in COMPANY_P1_PLATFORM_IDS + COMPANY_P2_PLATFORM_IDS:
@@ -2112,11 +2169,11 @@ async def profit_workflow_generators(request: Request):
     period = q.get("period") or _last_month()
     scope = q.get("scope") or "v1"
     platform_param = q.get("platform") or ""
-    platform_ids = _company_platform_ids(platform_param, scope)
+    platform_ids = _company_platform_ids(platform_param, scope, period=period)
     T = tok()
     rows = []
     for pid in platform_ids:
-        _, meta = _company_platform(pid)
+        _, meta = _company_platform_meta(pid, period=period, report_period=period)
         fields = {"payload_json": _compact_json({"platform_id": pid, "meta": meta, "report_period": period})}
         rows.append({
             "platform": pid,
@@ -2148,7 +2205,7 @@ async def profit_workflow_run_month(request: Request):
         raise HTTPException(400, "recipient_mode must be frankie or finance_gray")
 
     T = tok()
-    platform_ids = _company_platform_ids(platform_param, scope)
+    platform_ids = _company_platform_ids(platform_param, scope, period=report_period or period)
     results = []
     cards = {}
     for pid in platform_ids:
