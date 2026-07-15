@@ -40,6 +40,9 @@ COMPANY_CARD_TEMPLATE_VERSION = "v4-finance-summary-permission"
 COMPANY_CALLBACK_SEND_NEXT = os.environ.get("COMPANY_CALLBACK_SEND_NEXT", "false").lower() == "true"
 COMPANY_GENERATOR_ENABLED = os.environ.get("COMPANY_GENERATOR_ENABLED", "false").lower() == "true"
 COMPANY_GENERATOR_TIMEOUT = int(os.environ.get("COMPANY_GENERATOR_TIMEOUT", "30"))
+COMPANY_GENERATOR_ALLOWED_PLATFORMS = {
+    p.strip() for p in os.environ.get("COMPANY_GENERATOR_ALLOWED_PLATFORMS", "").split(",") if p.strip()
+}
 _N8N_WEBHOOK_BASE = (os.environ.get("N8N_WEBHOOK_BASE_URL")
                      or os.environ.get("N8N_PUBLIC_BASE_URL")
                      or os.environ.get("N8N_BASE_URL")
@@ -659,12 +662,15 @@ def _company_generator_status(fields):
         missing.append(auth_env)
     direct_types = {"n8n_webhook", "service_endpoint"}
     direct = gtype in direct_types and not missing
+    allowed = platform_id in COMPANY_GENERATOR_ALLOWED_PLATFORMS
     if not gtype:
         reason = "此平台还未登记自动生成器。"
     elif missing:
         reason = "生成器还不能直接触发，缺少：" + ", ".join(missing)
     elif gtype not in direct_types:
         reason = ft(meta.get("generator_note")) or "此生成器不是公司级直接触发入口。"
+    elif COMPANY_GENERATOR_ENABLED and not allowed:
+        reason = "生成器总开关已打开，但此平台未在灰度白名单中。"
     else:
         reason = "生成器已登记，可在开关打开后触发。"
     return {
@@ -676,8 +682,9 @@ def _company_generator_status(fields):
         "requires": required,
         "missing": missing,
         "direct": direct,
+        "allowed": allowed,
         "enabled": COMPANY_GENERATOR_ENABLED,
-        "ready": direct and COMPANY_GENERATOR_ENABLED,
+        "ready": direct and COMPANY_GENERATOR_ENABLED and allowed,
         "note": ft(meta.get("generator_note")),
         "reason": reason,
     }
@@ -717,6 +724,12 @@ def _company_trigger_generator(T, run, *, source_action="rerun"):
         _company_write_system_audit(T, f"{source_action}_generator_skipped_disabled", run_id,
                                     before, after, status, "skipped")
         return {"ok": False, "status": "skipped_disabled", "message": "生成器已登记，但 COMPANY_GENERATOR_ENABLED=false，本次没有触发外部报表。", "generator": status, "run": run}
+    if not status["allowed"]:
+        after = {"generator": status}
+        _company_update_run(T, run_id, {"最后动作": f"{source_action}_generator_skipped_not_allowed"})
+        _company_write_system_audit(T, f"{source_action}_generator_skipped_not_allowed", run_id,
+                                    before, after, status, "skipped")
+        return {"ok": False, "status": "skipped_not_allowed", "message": "生成器总开关已打开，但此平台未在灰度白名单中，本次没有触发外部报表。", "generator": status, "run": run}
 
     payload = _company_run_payload(fields)
     period = ft(fields.get("期间"))
@@ -2093,6 +2106,7 @@ async def profit_workflow_generators(request: Request):
             "generator": _company_generator_status(fields),
         })
     return {"period": period, "scope": scope, "generator_enabled": COMPANY_GENERATOR_ENABLED,
+            "allowed_platforms": sorted(COMPANY_GENERATOR_ALLOWED_PLATFORMS),
             "n8n_webhook_base": N8N_WEBHOOK_BASE_URL, "platforms": rows}
 
 
@@ -2149,6 +2163,7 @@ async def profit_workflow_run_month(request: Request):
             "message": audit.get("message"),
             "generator": {"status": generator.get("status"), "message": generator.get("message"),
                           "ready": (generator.get("generator") or {}).get("ready"),
+                          "allowed": (generator.get("generator") or {}).get("allowed"),
                           "type": (generator.get("generator") or {}).get("type"),
                           "workflow_id": (generator.get("generator") or {}).get("workflow_id")},
             "sent": sent,
@@ -2192,6 +2207,7 @@ async def profit_workflow_rerun(request: Request):
             "generator": {"status": (result.get("generator") or {}).get("status"),
                           "message": (result.get("generator") or {}).get("message"),
                           "ready": ((result.get("generator") or {}).get("generator") or {}).get("ready"),
+                          "allowed": ((result.get("generator") or {}).get("generator") or {}).get("allowed"),
                           "type": ((result.get("generator") or {}).get("generator") or {}).get("type"),
                           "workflow_id": ((result.get("generator") or {}).get("generator") or {}).get("workflow_id")},
             "message": result.get("message"),
