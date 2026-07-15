@@ -638,8 +638,10 @@ def _company_generator_record_id(payload):
 
 def _company_generator_status(fields):
     payload = _company_run_payload(fields)
-    meta = payload.get("meta") or {}
     platform_id = ft(payload.get("platform_id"))
+    registry_meta = COMPANY_PLATFORM_REGISTRY.get(platform_id, {})
+    meta = dict(registry_meta)
+    meta.update({k: v for k, v in (payload.get("meta") or {}).items() if v not in ("", None)})
     gtype = ft(meta.get("generator_type"))
     url = _company_generator_url(meta)
     required = ft(meta.get("generator_requires"))
@@ -721,7 +723,9 @@ def _company_trigger_generator(T, run, *, source_action="rerun"):
     report_period = ft(payload.get("report_period")) or period
     params = {"period": period, "month": report_period, "run_id": run_id, "source": source_action}
     headers = {}
-    meta = payload.get("meta") or {}
+    platform_id = ft(payload.get("platform_id"))
+    meta = dict(COMPANY_PLATFORM_REGISTRY.get(platform_id, {}))
+    meta.update({k: v for k, v in (payload.get("meta") or {}).items() if v not in ("", None)})
     auth_env = ft(meta.get("auth_token_env"))
     if auth_env and os.environ.get(auth_env):
         headers["Authorization"] = f"Bearer {os.environ[auth_env]}"
