@@ -572,13 +572,14 @@ def _company_run_id(period, platform_id):
     return f"company-profit-{period}-{platform_id}"
 
 
-def _company_report_link(T, period, platform_id):
-    if "smoke" in ft(period):
+def _company_report_link(T, period, platform_id, *, report_period=None):
+    lookup_period = ft(report_period or period)
+    if "smoke" in lookup_period:
         return ""
     field = COMPANY_REPORT_FIELD_BY_PLATFORM.get(platform_id)
     if not field:
         return ""
-    ym_slash = ft(period).replace("-", "/")
+    ym_slash = lookup_period.replace("-", "/")
     return _idx_links_all(T, ym_slash).get(field) or ""
 
 
@@ -610,10 +611,10 @@ def _bt_write(T, tbl, fields, key_field=None):
     return {"act": "create", "record_id": (r.get("data") or {}).get("record", {}).get("record_id")}
 
 
-def _company_seed_run(T, period, platform_id, *, override=None):
+def _company_seed_run(T, period, platform_id, *, override=None, report_period=None):
     platform_id, meta = _company_platform(platform_id)
     run_id = _company_run_id(period, platform_id)
-    report_link = _company_report_link(T, period, platform_id)
+    report_link = _company_report_link(T, period, platform_id, report_period=report_period)
     fields = {
         "run_id": run_id,
         "期间": period,
@@ -628,7 +629,7 @@ def _company_seed_run(T, period, platform_id, *, override=None):
         "报表链接": report_link,
         "最后动作": "seed_run",
         "最后动作时间": str(_now_ms()),
-        "payload_json": _compact_json({"platform_id": platform_id, "meta": meta}),
+        "payload_json": _compact_json({"platform_id": platform_id, "meta": meta, "report_period": ft(report_period or period)}),
     }
     if override:
         fields.update({k: str(v) if isinstance(v, (int, float, bool)) else v for k, v in override.items()})
@@ -1450,6 +1451,7 @@ async def profit_workflow_test_cards(request: Request):
         raise HTTPException(401, "unauthorized")
     q = request.query_params
     period = q.get("period") or _last_month()
+    report_period = q.get("report_period")
     platform_id = q.get("platform") or "funlabswitch"
     card_type = q.get("card_type") or "both"  # p0_gap / finance / both
     recipient_mode = q.get("recipient_mode") or "frankie"  # frankie / finance_gray
@@ -1457,7 +1459,7 @@ async def profit_workflow_test_cards(request: Request):
         raise HTTPException(400, "recipient_mode=finance_gray only supports card_type=finance")
     send = q.get("send") == "true"
     T = tok()
-    run = _company_seed_run(T, period, platform_id)
+    run = _company_seed_run(T, period, platform_id, report_period=report_period)
     rf = run.get("fields", {})
     run_id = ft(rf.get("run_id"))
     platform = ft(rf.get("平台"))
@@ -1492,7 +1494,7 @@ async def profit_workflow_test_cards(request: Request):
                 if mid:
                     _append_company_message_id(T, run_id, mid)
                 sent[name].append({"to": recipient["name"], "code": res.get("code"), "message_id": mid})
-    return {"period": period, "platform": platform_id, "run_id": run_id, "frankie_only": recipient_mode == "frankie",
+    return {"period": period, "report_period": report_period or period, "platform": platform_id, "run_id": run_id, "frankie_only": recipient_mode == "frankie",
             "recipient_mode": recipient_mode,
             "card_template": {"schema": COMPANY_CARD_SCHEMA, "version": COMPANY_CARD_TEMPLATE_VERSION},
             "send": send, "sent": sent, "cards": cards if not send else list(cards.keys()),
