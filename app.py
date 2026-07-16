@@ -615,6 +615,16 @@ def _aggnum(x):
     except: return 0.0
 
 
+NON_P0_COST_SOURCE_MARKERS = (
+    "FBA盘点/退货冲抵",
+)
+
+
+def _company_cost_source_non_p0(source):
+    s = ft(source)
+    return any(marker in s for marker in NON_P0_COST_SOURCE_MARKERS)
+
+
 def colexact(hdr, name):
     for i, h in enumerate(hdr):
         if h == name: return i
@@ -1128,15 +1138,19 @@ def _agg_xb(T, ss):
              freight=colidx(hdr, "头程", "RMB"), ad1=colidx(hdr, "广告费", "RMB"), ad2=colidx(hdr, "推广费", "RMB"),
              commission=colidx(hdr, "佣金", "RMB"), deliver=colidx(hdr, "配送费", "RMB"),
              storage=colidx(hdr, "仓储费", "RMB"), vat=colidx(hdr, "VAT", "RMB"), adj=colidx(hdr, "调整", "RMB"),
-             qty=colexact(hdr, "销量"), rq=colidx(hdr, "退货数量") or colidx(hdr, "退款数量"))
+             qty=colexact(hdr, "销量"), rq=colidx(hdr, "退货数量") or colidx(hdr, "退款数量"),
+             cost_source=colidx(hdr, "成本来源"))
     a = dict(sales=0, margin=0, payback=0, cost=0, freight=0, ad=0, pf=0, qty=0, rq=0, cm_n=0, cm_amt=0)
     def g(row, i): return _aggnum(row[i]) if (i is not None and i < len(row)) else 0
+    def text(row, i): return ft(row[i]) if (i is not None and i < len(row)) else ""
     for row in rows:
         rs = g(row, c["sales"]); rc = g(row, c["cost"])
         qty = g(row, c["qty"])
         refund_qty = g(row, c["rq"])
         net_qty = qty - refund_qty
-        if rs > 0 and net_qty > 0 and abs(rc) < 0.005: a["cm_n"] += 1; a["cm_amt"] += rs   # 成本缺失行(有净销量且采购=0)
+        source_non_p0 = _company_cost_source_non_p0(text(row, c["cost_source"]))
+        if rs > 0 and net_qty > 0 and abs(rc) < 0.005 and not source_non_p0:
+            a["cm_n"] += 1; a["cm_amt"] += rs   # 成本缺失行(有净销量且采购=0)
         a["sales"] += rs; a["margin"] += g(row, c["margin"]); a["payback"] += g(row, c["payback"])
         a["cost"] += rc; a["freight"] += g(row, c["freight"]); a["ad"] += g(row, c["ad1"]) + g(row, c["ad2"])
         a["pf"] += g(row, c["commission"]) + g(row, c["deliver"]) + g(row, c["storage"]) + g(row, c["vat"]) + g(row, c["adj"])
@@ -1582,6 +1596,8 @@ def _company_cost_gap_details_from_sheet(T, token, ptype, limit=30):
             is_gap = net_qty > 0 and sales > 0 and abs(g(row, "cost")) < 0.005
         else:
             is_gap = sales > 0 and g(row, "cost") == 0
+        if is_gap and _company_cost_source_non_p0(txt(row, "cost_source")):
+            is_gap = False
         if not is_gap:
             continue
         details.append({
