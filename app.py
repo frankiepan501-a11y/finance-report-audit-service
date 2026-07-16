@@ -815,9 +815,21 @@ def _company_generator_status(fields, T=None):
         "allowed": allowed,
         "enabled": COMPANY_GENERATOR_ENABLED,
         "ready": direct and COMPANY_GENERATOR_ENABLED and allowed,
+        "async_default": direct,
+        "poll_endpoint": "/profit-workflow/poll-run",
+        "trace_sources": ["company_run_table", "company_audit_table", "n8n_executions" if gtype == "n8n_webhook" else "service_response"],
         "note": ft(meta.get("generator_note")),
         "reason": reason,
     }
+
+
+def _company_async_generation_requested(q, generator_status=None):
+    raw = ft(q.get("async_generate") or q.get("async")).lower()
+    if raw in ("false", "0", "no", "sync"):
+        return False
+    if raw in ("true", "1", "yes", "async"):
+        return True
+    return bool((generator_status or {}).get("direct"))
 
 
 def _company_refresh_report_link(T, run):
@@ -2729,7 +2741,7 @@ async def profit_workflow_run_month(request: Request):
     send = q.get("send") == "true"
     include_cards = q.get("include_cards") == "true"
     generate = q.get("generate") == "true"
-    async_generate = q.get("async") == "true" or q.get("async_generate") == "true"
+    any_async_generate = False
     if recipient_mode not in ("frankie", "finance_gray"):
         raise HTTPException(400, "recipient_mode must be frankie or finance_gray")
 
@@ -2741,7 +2753,9 @@ async def profit_workflow_run_month(request: Request):
         run = _company_seed_run(T, period, pid, report_period=report_period)
         run_id = ft((run or {}).get("fields", {}).get("run_id"))
         generator_status = _company_generator_status((run.get("fields") or {}), T=T)
+        async_generate = _company_async_generation_requested(q, generator_status)
         if generate and async_generate and generator_status.get("ready"):
+            any_async_generate = True
             before = {"run": (run or {}).get("fields", {}), "generator": generator_status}
             run = _company_update_run(T, run_id, {"报表状态": "AI生成中", "当前阻断方": "AI自动化",
                                                  "最后动作": "run_month_generator_async_started"}) or run
@@ -2803,7 +2817,7 @@ async def profit_workflow_run_month(request: Request):
         })
     return {"period": period, "report_period": report_period or period, "scope": scope,
             "platforms": platform_ids, "recipient_mode": recipient_mode, "generate": generate,
-            "async_generate": async_generate, "send": send, "results": results,
+            "async_generate": any_async_generate, "send": send, "results": results,
             "card_template": {"schema": COMPANY_CARD_SCHEMA, "version": COMPANY_CARD_TEMPLATE_VERSION},
             "cards": cards if include_cards else {},
             "ledger": {"run_table": COMPANY_RUN_TBL, "gap_table": COMPANY_GAP_TBL, "audit_table": COMPANY_AUDIT_TBL}}
@@ -2826,14 +2840,15 @@ async def profit_workflow_rerun(request: Request):
     if recipient_mode not in ("frankie", "finance_gray"):
         raise HTTPException(400, "recipient_mode must be frankie or finance_gray")
     generate = q.get("generate", "true") != "false"
-    async_generate = q.get("async") == "true" or q.get("async_generate") == "true"
     T = tok()
-    if generate and async_generate:
+    async_generate = False
+    if generate:
         run = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id)
         if not run:
             raise HTTPException(404, f"run not found: {run_id}")
         generator_status = _company_generator_status((run.get("fields") or {}), T=T)
-        if generator_status.get("ready"):
+        async_generate = _company_async_generation_requested(q, generator_status)
+        if async_generate and generator_status.get("ready"):
             before = {"run": (run or {}).get("fields", {}), "generator": generator_status}
             run = _company_update_run(T, run_id, {"报表状态": "AI生成中", "当前阻断方": "AI自动化",
                                                  "最后动作": "manual_rerun_generator_async_started"}) or run
