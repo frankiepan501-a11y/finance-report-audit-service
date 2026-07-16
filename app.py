@@ -98,6 +98,7 @@ COMPANY_REPORT_FIELD_BY_PLATFORM = {
 COMPANY_AGG_PLATFORM_BY_REPORT_FIELD = {v: k for k, v in COMPANY_REPORT_FIELD_BY_PLATFORM.items()}
 COMPANY_AGG_PLATFORM_BY_REPORT_FIELD["独立站毛利报表"] = "funlab_net"
 COMPANY_AGG_APPROVED_STATUSES = {"财务通过", "已灌总表", "已归档"}
+COMPANY_REPORT_FIELD_FALLBACKS = {"独立站funlab.net毛利报表": ["独立站毛利报表"]}
 
 COMPANY_V1_PLATFORM_IDS = ["domestic_ecom", "mercadolibre", "amazon", "walmart", "funlab_net", "powkong"]
 COMPANY_P0_PLATFORM_IDS = ["funlabswitch"]
@@ -605,7 +606,7 @@ GATE_PCT = float(os.environ.get("GATE_COST_MISSING_PCT", "5"))
 AGG_REPORTS = [
     ("亚马逊毛利报表", "跨境电商", "亚马逊", "亚马逊全站汇总", "", "xb"),
     ("沃尔玛毛利报表", "跨境电商", "沃尔玛", "沃尔玛全站汇总", "", "xb"),
-    ("独立站毛利报表", "跨境电商", "独立站", "funlab.net Shopify(FUNLAB)", "FUNLAB", "xb"),
+    ("独立站funlab.net毛利报表", "跨境电商", "独立站", "funlab.net Shopify(FUNLAB)", "FUNLAB", "xb"),
     ("独立站Powkong Admin API毛利报表", "跨境电商", "独立站", "powkong.com Shopify(POWKONG)", "POWKONG", "xb"),
     ("独立站funlabswitch毛利报表", "跨境电商", "独立站", "funlabswitch.com Shopline(FUNLAB)", "FUNLAB", "xb"),  # Shopline大站, sheet schema同xb, 回款列[34]已算(销售-网关费); 替代原手动灌表脚本
     ("美客多毛利报表", "跨境电商", "美客多", "美客多5店汇总", "", "ml"),
@@ -1375,6 +1376,11 @@ def do_aggregate():
     done = []; skipped = []; errs = []
     for fld, cat, plat, shop, brand, ptype in AGG_REPORTS:
         url = links.get(fld, "")
+        if not url:
+            for alias in COMPANY_REPORT_FIELD_FALLBACKS.get(fld, []):
+                url = links.get(alias, "")
+                if url:
+                    break
         if not url:
             skipped.append({"shop": shop, "why": "索引无链接"}); continue
         gate = _company_aggregate_gate(T, ym_dash, fld)
