@@ -1133,12 +1133,14 @@ def _agg_xb(T, ss):
     def g(row, i): return _aggnum(row[i]) if (i is not None and i < len(row)) else 0
     for row in rows:
         rs = g(row, c["sales"]); rc = g(row, c["cost"])
-        rq = g(row, c["qty"])
-        if rs > 0 and rq > 0 and rc == 0: a["cm_n"] += 1; a["cm_amt"] += rs   # 成本缺失行(有销量且采购=0)
+        qty = g(row, c["qty"])
+        refund_qty = g(row, c["rq"])
+        net_qty = qty - refund_qty
+        if rs > 0 and net_qty > 0 and abs(rc) < 0.005: a["cm_n"] += 1; a["cm_amt"] += rs   # 成本缺失行(有净销量且采购=0)
         a["sales"] += rs; a["margin"] += g(row, c["margin"]); a["payback"] += g(row, c["payback"])
         a["cost"] += rc; a["freight"] += g(row, c["freight"]); a["ad"] += g(row, c["ad1"]) + g(row, c["ad2"])
         a["pf"] += g(row, c["commission"]) + g(row, c["deliver"]) + g(row, c["storage"]) + g(row, c["vat"]) + g(row, c["adj"])
-        a["qty"] += rq; a["rq"] += g(row, c["rq"])
+        a["qty"] += qty; a["rq"] += refund_qty
     for k in ("cost", "freight", "ad", "pf"): a[k] = abs(a[k])
     return a
 
@@ -1575,7 +1577,8 @@ def _company_cost_gap_details_from_sheet(T, token, ptype, limit=30):
             sales = g(row, "netsales") or sales
             is_gap = g(row, "netqty") > 0 and g(row, "cost") == 0
         elif c.get("qty") is not None:
-            is_gap = g(row, "qty") > 0 and sales > 0 and g(row, "cost") == 0
+            net_qty = g(row, "qty") - g(row, "rq")
+            is_gap = net_qty > 0 and sales > 0 and abs(g(row, "cost")) < 0.005
         else:
             is_gap = sales > 0 and g(row, "cost") == 0
         if not is_gap:
