@@ -95,6 +95,9 @@ COMPANY_REPORT_FIELD_BY_PLATFORM = {
     "tiktok_shop": "TikTok Shop毛利报表",
     "temu": "TEMU毛利报表",
 }
+COMPANY_AGG_PLATFORM_BY_REPORT_FIELD = {v: k for k, v in COMPANY_REPORT_FIELD_BY_PLATFORM.items()}
+COMPANY_AGG_PLATFORM_BY_REPORT_FIELD["独立站毛利报表"] = "funlab_net"
+COMPANY_AGG_APPROVED_STATUSES = {"财务通过", "已灌总表", "已归档"}
 
 COMPANY_V1_PLATFORM_IDS = ["domestic_ecom", "mercadolibre", "amazon", "walmart", "funlab_net", "powkong"]
 COMPANY_P0_PLATFORM_IDS = ["funlabswitch"]
@@ -1264,6 +1267,39 @@ def _agg_delete(T, ym_dash, cat, plat, shop):
     return False
 
 
+def _company_aggregate_gate(T, ym_dash, report_field):
+    platform_id = COMPANY_AGG_PLATFORM_BY_REPORT_FIELD.get(report_field)
+    if not platform_id:
+        return {"allow": False, "why": f"{report_field} 未登记公司运行台平台映射", "delete_stale": False}
+    run_id = _company_run_id(ym_dash, platform_id)
+    rec = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id)
+    if not rec:
+        return {"allow": False, "run_id": run_id, "why": f"{run_id} 尚未进入公司运行台", "delete_stale": False}
+    fields = rec.get("fields", {})
+    report_status = ft(fields.get("报表状态"))
+    total_status = ft(fields.get("总表状态"))
+    if report_status not in COMPANY_AGG_APPROVED_STATUSES:
+        return {
+            "allow": False,
+            "run_id": run_id,
+            "why": f"等待财务终审: 报表状态={report_status or '-'}; 总表状态={total_status or '-'}",
+            "delete_stale": True,
+        }
+    return {"allow": True, "run_id": run_id, "run": rec, "report_status": report_status, "total_status": total_status}
+
+
+def _company_mark_aggregate_loaded(T, gate):
+    run_id = gate.get("run_id")
+    if not run_id:
+        return None
+    report_status = ft(gate.get("report_status"))
+    fields = {"总表状态": "已灌总表", "最后动作": "aggregate_total_table_loaded"}
+    if report_status == "财务通过":
+        fields["报表状态"] = "已灌总表"
+        fields["当前阻断方"] = "归档"
+    return _company_update_run(T, run_id, fields)
+
+
 def do_aggregate():
     T = tok()
     last = datetime.date.today().replace(day=1) - datetime.timedelta(days=1)
@@ -1281,6 +1317,12 @@ def do_aggregate():
         url = links.get(fld, "")
         if not url:
             skipped.append({"shop": shop, "why": "索引无链接"}); continue
+        gate = _company_aggregate_gate(T, ym_dash, fld)
+        if not gate.get("allow"):
+            rm = _agg_delete(T, ym_dash, cat, plat, shop) if gate.get("delete_stale") else False
+            skipped.append({"shop": shop, "why": gate.get("why"), "gate": "finance_not_approved",
+                            "run_id": gate.get("run_id"), "removed_stale": rm})
+            continue
         try:
             if ptype == "xb": a = _agg_xb(T, url.split("/sheets/")[1].split("?")[0])
             elif ptype == "ecom": a = _agg_ecom(T, url.split("/sheets/")[1].split("?")[0])
@@ -1297,8 +1339,10 @@ def do_aggregate():
             skipped.append({"shop": shop, "why": f"审计未过:成本缺失{a['cm_n']}SKU ¥{round(cm_amt)}({pct:.1f}%>{GATE_PCT:.0f}%)", "gate": "fail", "removed_stale": rm}); continue
         fields = _agg_fields(ym_dash, cat, plat, shop, brand, a, url, ptype)
         act = _agg_upsert(T, ym_dash, cat, plat, shop, fields)
+        _company_mark_aggregate_loaded(T, gate)
         done.append({"shop": shop, "act": act, "sales": round(a["sales"]), "margin": round(a["margin"]), "payback": round(a["payback"]),
-                     "cost_missing": (f"{a['cm_n']}SKU ¥{round(cm_amt)}" if a.get("cm_n") else None)})
+                     "cost_missing": (f"{a['cm_n']}SKU ¥{round(cm_amt)}" if a.get("cm_n") else None),
+                     "run_id": gate.get("run_id")})
     # 总表授权(铁律①): 财务部全体可管理 + Frankie 可管理
     fin = _dept_members(T, FIN_DEPT)
     _grant_one(T, IDX_APP, "bitable", FRANKIE, "full_access")
