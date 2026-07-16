@@ -1548,6 +1548,7 @@ def _company_cost_gap_details_from_sheet(T, token, ptype, limit=30):
         "msku": colidx(hdr, "MSKU") or colexact(hdr, "SKU") or colidx(hdr, "SKU"),
         "name": colidx(hdr, "中文名称") or colidx(hdr, "商品名称") or colidx(hdr, "品名"),
         "qty": colexact(hdr, "销量") or colidx(hdr, "销量"),
+        "rq": colidx(hdr, "退货数量") or colidx(hdr, "退款数量"),
         "sales": colidx(hdr, "售价", "RMB") or colidx(hdr, "销售额", "RMB") or colidx(hdr, "净销售额"),
         "cost": colidx(hdr, "采购成本", "RMB") or colidx(hdr, "采购成本"),
         "freight": colidx(hdr, "头程", "RMB") or colidx(hdr, "物流成本"),
@@ -1805,16 +1806,14 @@ def _company_sync_owner_cost_gaps(T, run, report_summary, *, source_action="audi
     if not run_id:
         return []
     details = report_summary.get("gap_details") or []
-    if not details:
-        return []
-    period = ft(fields.get("期间"))
-    ident = _company_meta_from_run(fields)
     grouped = defaultdict(list)
     for item in details:
         owner = ft(item.get("owner")) or "待确认负责人"
         grouped[owner].append(item)
     current_gap_ids = set()
     created = []
+    period = ft(fields.get("期间"))
+    ident = _company_meta_from_run(fields)
     for owner, rows in sorted(grouped.items(), key=lambda kv: (-sum(float(x.get("sales_rmb") or 0) for x in kv[1]), kv[0])):
         detail = _company_owner_gap_detail_text(owner, rows)
         gap = _company_create_gap(
@@ -1852,6 +1851,7 @@ def _company_apply_report_audit_gate(T, run, *, source_action="finance_card_repo
     summary = report_summary.get("summary") or {}
     cm_n = int(summary.get("cm_n") or 0)
     if cm_n <= 0:
+        _company_sync_owner_cost_gaps(T, run, report_summary, source_action=source_action)
         return run
     period = ft(fields.get("期间"))
     ident = _company_meta_from_run(fields)
