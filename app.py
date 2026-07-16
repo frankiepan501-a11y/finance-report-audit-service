@@ -1300,6 +1300,66 @@ def _company_mark_aggregate_loaded(T, gate):
     return _company_update_run(T, run_id, fields)
 
 
+def _company_calc_aggregate(T, url, ptype, ym_dash):
+    token, typ = _parse_link(url)
+    if ptype == "xb":
+        if typ != "sheet" or not token:
+            raise ValueError("跨境报表链接不是电子表格")
+        return _agg_xb(T, token)
+    if ptype == "ecom":
+        if typ != "sheet" or not token:
+            raise ValueError("国内电商报表链接不是电子表格")
+        return _agg_ecom(T, token)
+    if ptype == "ml":
+        return _agg_ml(T, ym_dash)
+    raise ValueError(f"未知报表类型: {ptype}")
+
+
+def _company_aggregate_run(T, run_id, *, archive=False):
+    run = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id)
+    fields = (run or {}).get("fields", {})
+    if not fields:
+        return {"ok": False, "reason": f"run not found: {run_id}"}
+    payload, cfg = _company_agg_config(fields)
+    if not cfg:
+        return {"ok": False, "run_id": run_id, "reason": "这个平台还没有接入统一汇总解析"}
+    period = ft(payload.get("report_period")) or ft(fields.get("期间"))
+    ym_dash = period.replace("/", "-")
+    report_link = ft(fields.get("报表链接"))
+    if not report_link:
+        return {"ok": False, "run_id": run_id, "reason": "没有绑定毛利报表链接"}
+
+    fld, cat, plat, shop, brand, ptype = cfg
+    gate = _company_aggregate_gate(T, ym_dash, fld)
+    if not gate.get("allow"):
+        return {"ok": False, "run_id": run_id, "reason": gate.get("why"), "gate": "finance_not_approved"}
+    try:
+        a = _company_calc_aggregate(T, report_link, ptype, ym_dash)
+    except Exception as e:
+        return {"ok": False, "run_id": run_id, "reason": str(e)[:120]}
+    if not a or a["sales"] <= 0:
+        rm = _agg_delete(T, ym_dash, cat, plat, shop)
+        return {"ok": False, "run_id": run_id, "reason": "数据缺漏:报表空/0销售", "removed_stale": rm}
+
+    cm_amt = a.get("cm_amt", 0)
+    pct = (cm_amt / a["sales"] * 100) if a["sales"] else 0
+    if cm_amt > 0 and pct > GATE_PCT:
+        rm = _agg_delete(T, ym_dash, cat, plat, shop)
+        return {"ok": False, "run_id": run_id,
+                "reason": f"审计未过:成本缺失{a['cm_n']}SKU ¥{round(cm_amt)}({pct:.1f}%>{GATE_PCT:.0f}%)",
+                "removed_stale": rm}
+
+    out_fields = _agg_fields(ym_dash, cat, plat, shop, brand, a, report_link, ptype)
+    act = _agg_upsert(T, ym_dash, cat, plat, shop, out_fields)
+    _company_mark_aggregate_loaded(T, gate)
+    if archive:
+        _company_update_run(T, run_id, {"报表状态": "已归档", "当前阻断方": "已完成",
+                                        "总表状态": "已灌总表", "最后动作": "company_profit_archive_completed"})
+    return {"ok": True, "run_id": run_id, "shop": shop, "act": act,
+            "sales": round(a["sales"]), "margin": round(a["margin"]),
+            "payback": round(a["payback"]), "archived": archive}
+
+
 def do_aggregate():
     T = tok()
     last = datetime.date.today().replace(day=1) - datetime.timedelta(days=1)
@@ -1324,9 +1384,7 @@ def do_aggregate():
                             "run_id": gate.get("run_id"), "removed_stale": rm})
             continue
         try:
-            if ptype == "xb": a = _agg_xb(T, url.split("/sheets/")[1].split("?")[0])
-            elif ptype == "ecom": a = _agg_ecom(T, url.split("/sheets/")[1].split("?")[0])
-            else: a = _agg_ml(T, ym_dash)
+            a = _company_calc_aggregate(T, url, ptype, ym_dash)
         except Exception as e:
             errs.append({"shop": shop, "err": str(e)[:100]}); continue
         if not a or a["sales"] <= 0:
@@ -2510,6 +2568,7 @@ def _handle_company_callback(body):
     target_type = "run"
     target_id = run_id
     result_message = "已处理。"
+    aggregate_result = None
 
     if action == "company_profit_gap_resolved":
         target_type, target_id = "gap", gap_id
@@ -2552,6 +2611,13 @@ def _handle_company_callback(body):
         else:
             update_fields, result_message = _company_mark_finance_approved(T, run_id, before_run)
             _company_update_run(T, run_id, update_fields)
+            if not _company_is_smoke_run(before_run, run_id):
+                aggregate_result = _company_aggregate_run(T, run_id, archive=True)
+                if aggregate_result.get("ok"):
+                    result_message = f"{result_message} 已写入公司总毛利表并完成归档。"
+                else:
+                    ok = False
+                    result_message = f"{result_message} 但自动灌总表未完成：{aggregate_result.get('reason')}"
     elif action == "company_profit_finance_return":
         _company_update_run(T, run_id, {"报表状态": "P0待处理", "当前阻断方": "财务部",
                                         "P0数量": str(max(1, _company_open_p0_count(T, run_id))),
@@ -2563,8 +2629,11 @@ def _handle_company_callback(body):
 
     after = {"run": (_bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or {}).get("fields", {}),
              "gap": (_bt_find(T, COMPANY_GAP_TBL, "gap_id", gap_id) or {}).get("fields", {}) if gap_id else {}}
+    callback_payload = {"value": value, "form_value": ctx["form_value"]}
+    if aggregate_result is not None:
+        callback_payload["aggregate_result"] = aggregate_result
     _company_write_audit(T, idempotency_key, action, ctx["operator_open_id"], run_id, target_type, target_id,
-                         before, after, {"value": value, "form_value": ctx["form_value"]},
+                         before, after, callback_payload,
                          "ok" if ok else "blocked", ctx["message_id"])
     after_run = after.get("run") or {}
     after_gap = after.get("gap") or {}
