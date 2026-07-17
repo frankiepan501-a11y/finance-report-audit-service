@@ -103,6 +103,8 @@ COMPANY_REPORT_VERSION_FIELD_BY_PLATFORM = {
     "amazon": "亚马逊报表版本",
 }
 COMPANY_REPORT_FINAL_VERSION = "财务终稿"
+COMPANY_INDEX_PLATFORM_FINAL_STATUS_FIELD = "平台终审状态"
+COMPANY_INDEX_PLATFORM_ARCHIVE_TIME_FIELD = "平台归档时间"
 
 COMPANY_V1_PLATFORM_IDS = ["domestic_ecom", "mercadolibre", "amazon", "walmart", "funlab_net", "powkong"]
 COMPANY_P0_PLATFORM_IDS = ["funlabswitch"]
@@ -1392,6 +1394,80 @@ def _company_aggregate_run(T, run_id, *, archive=False):
     return result
 
 
+def _company_index_field_names(T):
+    names = set(); pt = None
+    while True:
+        u = f"{FEISHU}/bitable/v1/apps/{IDX_APP}/tables/{IDX_TBL}/fields?page_size=100" + (f"&page_token={pt}" if pt else "")
+        d = requests.get(u, headers={"Authorization": f"Bearer {T}"}, timeout=30).json().get("data", {})
+        for f in d.get("items") or []:
+            names.add(f.get("field_name"))
+        pt = d.get("page_token")
+        if not d.get("has_more"):
+            break
+    return names
+
+
+def _company_ensure_index_finalize_fields(T):
+    have = _company_index_field_names(T)
+    needed = [COMPANY_INDEX_PLATFORM_FINAL_STATUS_FIELD, COMPANY_INDEX_PLATFORM_ARCHIVE_TIME_FIELD]
+    created = []
+    for name in needed:
+        if name in have:
+            continue
+        resp = requests.post(f"{FEISHU}/bitable/v1/apps/{IDX_APP}/tables/{IDX_TBL}/fields",
+                             headers={"Authorization": f"Bearer {T}", "Content-Type": "application/json"},
+                             json={"field_name": name, "type": 1}, timeout=20).json()
+        if resp.get("code") != 0:
+            return {"ok": False, "reason": resp.get("msg") or "index field create failed",
+                    "code": resp.get("code"), "field": name}
+        created.append(name)
+    return {"ok": True, "created": created}
+
+
+def _company_platform_final_label(platform_id, payload, run_fields):
+    meta = payload.get("meta") if isinstance(payload, dict) else {}
+    platform = ft((run_fields or {}).get("平台")) or ft(meta.get("platform"))
+    site = ft(meta.get("site"))
+    name = ft(meta.get("name"))
+    if platform_id in {"powkong", "funlab_net", "funlabswitch"}:
+        return site or name or platform or platform_id
+    return platform or name or site or platform_id
+
+
+def _company_archive_time_text(archive_ms):
+    try:
+        tz = datetime.timezone(datetime.timedelta(hours=8))
+        return datetime.datetime.fromtimestamp(int(archive_ms) / 1000, tz=tz).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(archive_ms)
+
+
+def _company_merge_index_platform_text(raw, label, value):
+    values = {}
+    order = []
+    text = ft(raw)
+    for line in str(text).replace("\r", "\n").split("\n"):
+        line = line.strip().strip(";")
+        if not line:
+            continue
+        sep = "："
+        if sep not in line:
+            sep = ":" if ":" in line else ("=" if "=" in line else "")
+        if not sep:
+            continue
+        k, v = line.split(sep, 1)
+        k = k.strip()
+        if not k:
+            continue
+        if k not in values:
+            order.append(k)
+        values[k] = v.strip()
+    if label not in values:
+        order.append(label)
+    values[label] = str(value)
+    return "\n".join(f"{k}：{values[k]}" for k in order)
+
+
 def _company_mark_index_finalized(T, run_fields, archive_ms):
     payload = _company_run_payload(run_fields)
     platform_id = ft(payload.get("platform_id"))
@@ -1399,16 +1475,28 @@ def _company_mark_index_finalized(T, run_fields, archive_ms):
     if not platform_id or not period or "smoke" in period:
         return {"ok": True, "skipped": "not a production platform run"}
     version_field = COMPANY_REPORT_VERSION_FIELD_BY_PLATFORM.get(platform_id)
-    if not version_field:
-        return {"ok": True, "skipped": "no platform version field", "platform_id": platform_id}
     ym_slash = period.replace("-", "/")
     rec = _idx_find_record(T, ym_slash)
     if not rec:
         return {"ok": False, "reason": f"index row not found: {ym_slash}", "platform_id": platform_id}
+    ensure = _company_ensure_index_finalize_fields(T)
+    if not ensure.get("ok"):
+        ensure["platform_id"] = platform_id
+        return ensure
+    rec_fields = rec.get("fields", {})
+    label = _company_platform_final_label(platform_id, payload, run_fields)
+    archive_time_text = _company_archive_time_text(archive_ms)
     fields = {
-        version_field: COMPANY_REPORT_FINAL_VERSION,
+        COMPANY_INDEX_PLATFORM_FINAL_STATUS_FIELD: _company_merge_index_platform_text(
+            rec_fields.get(COMPANY_INDEX_PLATFORM_FINAL_STATUS_FIELD), label, COMPANY_REPORT_FINAL_VERSION
+        ),
+        COMPANY_INDEX_PLATFORM_ARCHIVE_TIME_FIELD: _company_merge_index_platform_text(
+            rec_fields.get(COMPANY_INDEX_PLATFORM_ARCHIVE_TIME_FIELD), label, archive_time_text
+        ),
         "财务收口完成时间": archive_ms,
     }
+    if version_field:
+        fields[version_field] = COMPANY_REPORT_FINAL_VERSION
     try:
         H = {"Authorization": f"Bearer {T}", "Content-Type": "application/json"}
         resp = requests.put(f"{FEISHU}/bitable/v1/apps/{IDX_APP}/tables/{IDX_TBL}/records/{rec['record_id']}",
@@ -1420,7 +1508,11 @@ def _company_mark_index_finalized(T, run_fields, archive_ms):
                 "code": resp.get("code"), "platform_id": platform_id}
     return {"ok": True, "record_id": rec["record_id"], "platform_id": platform_id,
             "version_field": version_field, "version": COMPANY_REPORT_FINAL_VERSION,
-            "archive_time": archive_ms}
+            "status_field": COMPANY_INDEX_PLATFORM_FINAL_STATUS_FIELD,
+            "archive_time_field": COMPANY_INDEX_PLATFORM_ARCHIVE_TIME_FIELD,
+            "platform_label": label, "archive_time": archive_ms,
+            "archive_time_text": archive_time_text,
+            "created_fields": ensure.get("created") or []}
 
 
 def do_aggregate():
