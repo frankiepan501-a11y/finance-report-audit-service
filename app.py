@@ -99,6 +99,10 @@ COMPANY_AGG_PLATFORM_BY_REPORT_FIELD = {v: k for k, v in COMPANY_REPORT_FIELD_BY
 COMPANY_AGG_PLATFORM_BY_REPORT_FIELD["独立站毛利报表"] = "funlab_net"
 COMPANY_AGG_APPROVED_STATUSES = {"财务通过", "已灌总表", "已归档"}
 COMPANY_REPORT_FIELD_FALLBACKS = {"独立站funlab.net毛利报表": ["独立站毛利报表"]}
+COMPANY_REPORT_VERSION_FIELD_BY_PLATFORM = {
+    "amazon": "亚马逊报表版本",
+}
+COMPANY_REPORT_FINAL_VERSION = "财务终稿"
 
 COMPANY_V1_PLATFORM_IDS = ["domestic_ecom", "mercadolibre", "amazon", "walmart", "funlab_net", "powkong"]
 COMPANY_P0_PLATFORM_IDS = ["funlabswitch"]
@@ -562,6 +566,13 @@ def _idx_links_all(T, ym_slash):
         if ft(f.get("日期")) == ym_slash:
             return {k: (f.get(k, {}).get("link") if isinstance(f.get(k), dict) else "") for k in GRANT_FIELDS}
     return {}
+
+
+def _idx_find_record(T, ym_slash):
+    for r in _bitable_all(T, IDX_APP, IDX_TBL):
+        if ft(r.get("fields", {}).get("日期")) == ym_slash:
+            return r
+    return None
 
 
 def do_grant():
@@ -1073,7 +1084,7 @@ def _company_create_gap(T, run_id, period, platform, gap_type, detail, *, p_leve
 
 def _company_update_run(T, run_id, fields):
     fields = dict(fields)
-    fields["最后动作时间"] = str(_now_ms())
+    fields.setdefault("最后动作时间", str(_now_ms()))
     rec = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id)
     if not rec:
         return None
@@ -1365,12 +1376,51 @@ def _company_aggregate_run(T, run_id, *, archive=False):
     out_fields = _agg_fields(ym_dash, cat, plat, shop, brand, a, report_link, ptype)
     act = _agg_upsert(T, ym_dash, cat, plat, shop, out_fields)
     _company_mark_aggregate_loaded(T, gate)
+    index_archive = None
     if archive:
+        archive_ms = _now_ms()
         _company_update_run(T, run_id, {"报表状态": "已归档", "当前阻断方": "已完成",
-                                        "总表状态": "已灌总表", "最后动作": "company_profit_archive_completed"})
-    return {"ok": True, "run_id": run_id, "shop": shop, "act": act,
-            "sales": round(a["sales"]), "margin": round(a["margin"]),
-            "payback": round(a["payback"]), "archived": archive}
+                                        "总表状态": "已灌总表",
+                                        "最后动作": "company_profit_archive_completed",
+                                        "最后动作时间": str(archive_ms)})
+        index_archive = _company_mark_index_finalized(T, fields, archive_ms)
+    result = {"ok": True, "run_id": run_id, "shop": shop, "act": act,
+              "sales": round(a["sales"]), "margin": round(a["margin"]),
+              "payback": round(a["payback"]), "archived": archive}
+    if index_archive is not None:
+        result["index_archive"] = index_archive
+    return result
+
+
+def _company_mark_index_finalized(T, run_fields, archive_ms):
+    payload = _company_run_payload(run_fields)
+    platform_id = ft(payload.get("platform_id"))
+    period = ft(payload.get("report_period")) or ft(run_fields.get("期间"))
+    if not platform_id or not period or "smoke" in period:
+        return {"ok": True, "skipped": "not a production platform run"}
+    version_field = COMPANY_REPORT_VERSION_FIELD_BY_PLATFORM.get(platform_id)
+    if not version_field:
+        return {"ok": True, "skipped": "no platform version field", "platform_id": platform_id}
+    ym_slash = period.replace("-", "/")
+    rec = _idx_find_record(T, ym_slash)
+    if not rec:
+        return {"ok": False, "reason": f"index row not found: {ym_slash}", "platform_id": platform_id}
+    fields = {
+        version_field: COMPANY_REPORT_FINAL_VERSION,
+        "财务收口完成时间": archive_ms,
+    }
+    try:
+        H = {"Authorization": f"Bearer {T}", "Content-Type": "application/json"}
+        resp = requests.put(f"{FEISHU}/bitable/v1/apps/{IDX_APP}/tables/{IDX_TBL}/records/{rec['record_id']}",
+                            headers=H, json={"fields": fields}, timeout=20).json()
+    except Exception as e:
+        return {"ok": False, "reason": str(e)[:160], "platform_id": platform_id}
+    if resp.get("code") != 0:
+        return {"ok": False, "reason": resp.get("msg") or "index update failed",
+                "code": resp.get("code"), "platform_id": platform_id}
+    return {"ok": True, "record_id": rec["record_id"], "platform_id": platform_id,
+            "version_field": version_field, "version": COMPANY_REPORT_FINAL_VERSION,
+            "archive_time": archive_ms}
 
 
 def do_aggregate():
@@ -2633,6 +2683,9 @@ def _handle_company_callback(body):
                 aggregate_result = _company_aggregate_run(T, run_id, archive=True)
                 if aggregate_result.get("ok"):
                     result_message = f"{result_message} 已写入公司总毛利表并完成归档。"
+                    index_archive = aggregate_result.get("index_archive") or {}
+                    if index_archive and not index_archive.get("ok"):
+                        result_message = f"{result_message} 但索引表状态未回写：{index_archive.get('reason')}"
                 else:
                     ok = False
                     result_message = f"{result_message} 但自动灌总表未完成：{aggregate_result.get('reason')}"
