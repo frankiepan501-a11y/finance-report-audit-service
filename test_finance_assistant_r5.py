@@ -14,7 +14,7 @@ from finance_assistant_r5 import (
 
 class FinanceAssistantR5CardTests(unittest.TestCase):
     def test_test_card_is_frankie_only_safe_and_routable(self):
-        card = build_r5_test_card("r5-20260902-abc123")
+        card = build_r5_test_card("r5-20260902-abc123", "nonce-123")
 
         self.assertEqual(card["schema"], "2.0")
         self.assertFalse(card["config"]["enable_forward"])
@@ -26,6 +26,7 @@ class FinanceAssistantR5CardTests(unittest.TestCase):
         self.assertEqual(behavior["type"], "callback")
         self.assertEqual(behavior["value"]["action"], "finance_r5_ack")
         self.assertEqual(behavior["value"]["run_id"], "r5-20260902-abc123")
+        self.assertEqual(behavior["value"]["nonce"], "nonce-123")
         self.assertEqual(validate_r5_card(card), [])
 
     def test_result_card_has_no_repeatable_action(self):
@@ -57,6 +58,9 @@ class FinanceAssistantR5CallbackTests(unittest.TestCase):
 
     def test_registry_marks_duplicate_without_reprocessing(self):
         registry = R5CallbackRegistry()
+        registry.register_sent("r5-run", "om-message", "nonce-123")
+        self.assertTrue(registry.is_registered("r5-run", "om-message", "nonce-123"))
+        self.assertFalse(registry.is_registered("r5-run", "om-message", "wrong"))
         first = registry.record("evt-1", "r5-run", "om-message", "ou-frankie")
         duplicate = registry.record("evt-1", "r5-run", "om-message", "ou-frankie")
 

@@ -3265,10 +3265,9 @@ async def finance_assistant_r5_preflight(request: Request):
 async def finance_assistant_r5_sample(request: Request):
     """只给 Frankie 发一张无业务副作用的 R5 测试卡。"""
     _require_internal_auth(request)
-    if not FINANCE_ASSISTANT_VERIFICATION_TOKEN:
-        raise HTTPException(503, "finance assistant verification token is not configured")
-    run_id = f"r5-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
-    card = build_r5_test_card(run_id)
+    run_id = f"r5-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex}"
+    nonce = uuid.uuid4().hex
+    card = build_r5_test_card(run_id, nonce)
     card_errors = validate_r5_card(card)
     if card_errors:
         raise HTTPException(500, {"card_preflight_failed": card_errors})
@@ -3276,7 +3275,7 @@ async def finance_assistant_r5_sample(request: Request):
     if response.get("code") != 0:
         raise HTTPException(502, {"feishu_code": response.get("code"), "feishu_msg": response.get("msg")})
     message_id = (response.get("data") or {}).get("message_id") or ""
-    _FINANCE_R5_CALLBACKS.register_sent(run_id, message_id)
+    _FINANCE_R5_CALLBACKS.register_sent(run_id, message_id, nonce)
     return {
         "ok": True,
         "app_id": FINANCE_ASSISTANT_APP_ID,
@@ -3292,20 +3291,26 @@ async def finance_assistant_r5_callback(request: Request):
     body = await request.json()
     if body.get("encrypt"):
         raise HTTPException(400, "encrypted callbacks are not supported in R5")
-    if not FINANCE_ASSISTANT_VERIFICATION_TOKEN:
-        raise HTTPException(503, "finance assistant verification token is not configured")
-    if not valid_callback_token(callback_token(body), FINANCE_ASSISTANT_VERIFICATION_TOKEN):
-        raise HTTPException(403, "invalid callback token")
     if body.get("type") == "url_verification" or body.get("challenge"):
         return {"challenge": body.get("challenge", "")}
+    strict_token_configured = bool(
+        re.fullmatch(r"[A-Za-z0-9_-]{16,128}", FINANCE_ASSISTANT_VERIFICATION_TOKEN or "")
+    )
+    if strict_token_configured and not valid_callback_token(
+        callback_token(body), FINANCE_ASSISTANT_VERIFICATION_TOKEN
+    ):
+        raise HTTPException(403, "invalid callback token")
 
     ctx = callback_context(body)
     value = ctx["value"]
     if value.get("action") != "finance_r5_ack" or value.get("schema") != "finance_assistant_r5_v1":
         return {"ignored": True, "reason": "not_finance_r5_action"}
     run_id = str(value.get("run_id") or "")
+    nonce = str(value.get("nonce") or "")
     if not run_id or not ctx["message_id"]:
         raise HTTPException(400, "run_id and open_message_id are required")
+    if not _FINANCE_R5_CALLBACKS.is_registered(run_id, ctx["message_id"], nonce):
+        raise HTTPException(403, "unregistered R5 card callback")
 
     record = _FINANCE_R5_CALLBACKS.record(
         ctx["event_id"], run_id, ctx["message_id"], ctx["operator_open_id"]

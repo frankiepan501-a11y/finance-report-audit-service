@@ -76,7 +76,7 @@ def _info_block(title: str, content: str, color: str) -> Dict[str, Any]:
     }
 
 
-def build_r5_test_card(run_id: str) -> Dict[str, Any]:
+def build_r5_test_card(run_id: str, nonce: str) -> Dict[str, Any]:
     card = _base_card(
         "财务助手回调测试",
         "R5 · 仅潘志聪可见 · 不操作财务数据",
@@ -114,6 +114,7 @@ def build_r5_test_card(run_id: str) -> Dict[str, Any]:
                         "action": R5_ACTION,
                         "schema": R5_SCHEMA,
                         "run_id": run_id,
+                        "nonce": nonce,
                     },
                 }
             ],
@@ -262,7 +263,7 @@ class R5CallbackRegistry:
         self._lock = threading.Lock()
         self._runs: Dict[str, Dict[str, Any]] = {}
 
-    def register_sent(self, run_id: str, message_id: str) -> Dict[str, Any]:
+    def register_sent(self, run_id: str, message_id: str, nonce: str) -> Dict[str, Any]:
         with self._lock:
             current = self._runs.setdefault(run_id, {})
             current.update({
@@ -272,8 +273,19 @@ class R5CallbackRegistry:
                 "status": "sent",
                 "callback_count": int(current.get("callback_count", 0)),
                 "event_ids": list(current.get("event_ids", [])),
+                "nonce_hash": hashlib.sha256(nonce.encode("utf-8")).hexdigest(),
             })
             return copy.deepcopy(current)
+
+    def is_registered(self, run_id: str, message_id: str, nonce: str) -> bool:
+        nonce_hash = hashlib.sha256(nonce.encode("utf-8")).hexdigest()
+        with self._lock:
+            current = self._runs.get(run_id) or {}
+            return bool(
+                current
+                and current.get("message_id") == message_id
+                and current.get("nonce_hash") == nonce_hash
+            )
 
     def record(self, event_id: str, run_id: str, message_id: str, operator_open_id: str) -> Dict[str, Any]:
         fingerprint = event_id or hashlib.sha256(
