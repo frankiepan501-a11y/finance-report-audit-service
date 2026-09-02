@@ -41,8 +41,11 @@ class FinanceAssistantR5CardTests(unittest.TestCase):
         response = build_r5_callback_response("r5-run", "2026-09-02 19:30:00")
 
         self.assertEqual(response["toast"]["type"], "success")
-        self.assertEqual(response["card"]["schema"], "2.0")
-        self.assertFalse(any(x.get("tag") == "button" for x in response["card"]["body"]["elements"]))
+        self.assertEqual(response["card"]["type"], "raw")
+        self.assertEqual(response["card"]["data"]["schema"], "2.0")
+        self.assertFalse(
+            any(x.get("tag") == "button" for x in response["card"]["data"]["body"]["elements"])
+        )
 
 
 class FinanceAssistantR5CallbackTests(unittest.TestCase):
