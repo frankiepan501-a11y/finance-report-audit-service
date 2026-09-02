@@ -14,12 +14,12 @@ from finance_assistant_r5 import (
     build_r5_result_card,
     build_r5_test_card,
     callback_context,
-    callback_token,
-    valid_callback_token,
     validate_r5_card,
 )
 from finance_assistant_r6 import (
     CallbackAuthError,
+    CallbackAuthNotConfigured,
+    build_r6_message_body,
     build_r6_monthly_overview_card,
     require_strict_callback_token,
     validate_r6_monthly_card,
@@ -87,7 +87,7 @@ N8N_API_KEY = os.environ.get("N8N_API_KEY", "")
 _COMPANY_ASYNC_JOBS = {}
 _COMPANY_ASYNC_LOCK = threading.Lock()
 _FINANCE_R5_CALLBACKS = R5CallbackRegistry()
-_FINANCE_R6_SEND_KEYS = set()
+_FINANCE_R6_SEND_RECEIPTS = {}
 _FINANCE_R6_SEND_LOCK = threading.Lock()
 
 COMPANY_PLATFORM_REGISTRY = {
@@ -2631,6 +2631,23 @@ def _send_event_card_union(T, union_id, card):
                                "content": json.dumps(card, ensure_ascii=False)}, timeout=20).json()
 
 
+def _finance_r6_send_card(T, union_id, card, idempotency_key):
+    return requests.post(
+        f"{FEISHU}/im/v1/messages?receive_id_type=union_id",
+        headers={"Authorization": f"Bearer {T}", "Content-Type": "application/json"},
+        json=build_r6_message_body(union_id, card, idempotency_key),
+        timeout=20,
+    ).json()
+
+
+def _finance_r6_log(event, **fields):
+    print(json.dumps({
+        "event": f"finance_assistant_r6.{event}",
+        "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        **fields,
+    }, ensure_ascii=False, sort_keys=True), flush=True)
+
+
 def _send_event_card_open_id(T, open_id, card):
     return requests.post(f"{FEISHU}/im/v1/messages?receive_id_type=open_id",
                          headers={"Authorization": f"Bearer {T}", "Content-Type": "application/json"},
@@ -3352,13 +3369,14 @@ async def finance_assistant_r5_callback(request: Request):
     body = await request.json()
     if body.get("encrypt"):
         raise HTTPException(400, "encrypted callbacks are not supported in R5")
-    if body.get("type") == "url_verification" or body.get("challenge"):
-        return {"challenge": body.get("challenge", "")}
     try:
         require_strict_callback_token(body, FINANCE_ASSISTANT_VERIFICATION_TOKEN)
+    except CallbackAuthNotConfigured as exc:
+        raise HTTPException(503, str(exc)) from exc
     except CallbackAuthError as exc:
-        status_code = 503 if "not configured" in str(exc) else 403
-        raise HTTPException(status_code, str(exc)) from exc
+        raise HTTPException(403, str(exc)) from exc
+    if body.get("type") == "url_verification" or body.get("challenge"):
+        return {"challenge": body.get("challenge", "")}
 
     ctx = callback_context(body)
     value = ctx["value"]
@@ -3448,29 +3466,39 @@ async def finance_assistant_r6_monthly_overview(request: Request):
         return result
 
     idempotency_key = str(q.get("idempotency_key") or "")
-    if not re.fullmatch(r"r6-[A-Za-z0-9_-]{12,80}", idempotency_key):
+    if not re.fullmatch(r"r6-[A-Za-z0-9_-]{12,47}", idempotency_key):
         raise HTTPException(400, "valid idempotency_key is required")
     with _FINANCE_R6_SEND_LOCK:
-        if idempotency_key in _FINANCE_R6_SEND_KEYS:
-            result.update({"duplicate": True, "sent": False})
-            return result
-        _FINANCE_R6_SEND_KEYS.add(idempotency_key)
-    try:
-        response = _send_event_card_union(T, FRANKIE_UNION_ID, card)
-        if response.get("code") != 0:
-            raise HTTPException(502, {
-                "feishu_code": response.get("code"),
-                "feishu_msg": response.get("msg"),
+        prior_message_id = _FINANCE_R6_SEND_RECEIPTS.get(idempotency_key)
+        if prior_message_id:
+            result.update({
+                "duplicate": True,
+                "sent": False,
+                "message_id": prior_message_id,
+                "idempotency_key": idempotency_key,
             })
-    except Exception:
-        with _FINANCE_R6_SEND_LOCK:
-            _FINANCE_R6_SEND_KEYS.discard(idempotency_key)
-        raise
+            _finance_r6_log("duplicate", period=period, rows=len(rows),
+                            pending_count=len(pending), idempotency_key=idempotency_key,
+                            message_id=prior_message_id)
+            return result
+    response = _finance_r6_send_card(T, FRANKIE_UNION_ID, card, idempotency_key)
+    if response.get("code") != 0:
+        raise HTTPException(502, {
+            "feishu_code": response.get("code"),
+            "feishu_msg": response.get("msg"),
+        })
+    message_id = (response.get("data") or {}).get("message_id") or ""
+    with _FINANCE_R6_SEND_LOCK:
+        _FINANCE_R6_SEND_RECEIPTS[idempotency_key] = message_id
     result.update({
         "sent": True,
-        "message_id": (response.get("data") or {}).get("message_id") or "",
+        "message_id": message_id,
         "idempotency_key": idempotency_key,
+        "idempotency_scope": "feishu-server-1h",
     })
+    _finance_r6_log("sent", period=period, rows=len(rows),
+                    pending_count=len(pending), idempotency_key=idempotency_key,
+                    message_id=message_id)
     return result
 
 

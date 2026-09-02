@@ -4,39 +4,49 @@
 from __future__ import annotations
 
 import hmac
+import json
+import re
 from typing import Any, Dict, Iterable, List
+
+from finance_assistant_r5 import callback_token
 
 
 class CallbackAuthError(ValueError):
     """回调来源配置缺失或校验失败。"""
 
 
-def _deep_get(obj: Dict[str, Any], *path: str) -> Any:
-    current: Any = obj
-    for key in path:
-        if not isinstance(current, dict):
-            return None
-        current = current.get(key)
-    return current
+class CallbackAuthNotConfigured(CallbackAuthError):
+    """服务端缺少 Verification Token，不能安全接收回调。"""
 
 
-def callback_token(body: Dict[str, Any]) -> str:
-    return str(
-        _deep_get(body, "header", "token")
-        or _deep_get(body, "event", "token")
-        or body.get("token")
-        or ""
-    )
+class CallbackAuthRejected(CallbackAuthError):
+    """回调未携带正确的 Verification Token。"""
 
 
 def require_strict_callback_token(body: Dict[str, Any], expected: str) -> None:
     """R6 起回调 token 必须已配置且恒定时间比对一致。"""
     expected = str(expected or "")
     if not expected:
-        raise CallbackAuthError("callback verification token is not configured")
+        raise CallbackAuthNotConfigured("callback verification token is not configured")
     provided = callback_token(body)
     if not provided or not hmac.compare_digest(provided, expected):
-        raise CallbackAuthError("invalid callback verification token")
+        raise CallbackAuthRejected("invalid callback verification token")
+
+
+def build_r6_message_body(
+    union_id: str,
+    card: Dict[str, Any],
+    idempotency_key: str,
+) -> Dict[str, Any]:
+    """构造带飞书服务端去重 UUID 的 R6 消息体。"""
+    if not re.fullmatch(r"r6-[A-Za-z0-9_-]{12,47}", str(idempotency_key or "")):
+        raise ValueError("valid R6 idempotency key is required (15-50 characters)")
+    return {
+        "receive_id": union_id,
+        "msg_type": "interactive",
+        "content": json.dumps(card, ensure_ascii=False),
+        "uuid": idempotency_key,
+    }
 
 
 def _money(value: Any) -> str:

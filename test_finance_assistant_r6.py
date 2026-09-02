@@ -3,6 +3,9 @@ import unittest
 
 from finance_assistant_r6 import (
     CallbackAuthError,
+    CallbackAuthNotConfigured,
+    CallbackAuthRejected,
+    build_r6_message_body,
     build_r6_monthly_overview_card,
     require_strict_callback_token,
     validate_r6_monthly_card,
@@ -11,11 +14,11 @@ from finance_assistant_r6 import (
 
 class FinanceAssistantR6Tests(unittest.TestCase):
     def test_callback_token_is_mandatory(self):
-        with self.assertRaisesRegex(CallbackAuthError, "not configured"):
+        with self.assertRaisesRegex(CallbackAuthNotConfigured, "not configured"):
             require_strict_callback_token({"header": {"token": "provided"}}, "")
 
     def test_callback_token_must_match(self):
-        with self.assertRaisesRegex(CallbackAuthError, "invalid"):
+        with self.assertRaisesRegex(CallbackAuthRejected, "invalid"):
             require_strict_callback_token({"header": {"token": "wrong"}}, "expected-token-1234")
 
     def test_matching_callback_token_passes(self):
@@ -23,6 +26,22 @@ class FinanceAssistantR6Tests(unittest.TestCase):
             {"header": {"token": "expected-token-1234"}},
             "expected-token-1234",
         )
+
+    def test_message_body_carries_server_side_idempotency_uuid(self):
+        card = build_r6_monthly_overview_card("2026-08", [], pending=[])
+        body = build_r6_message_body(
+            "on_frankie",
+            card,
+            "r6-202608-finance-gray-001",
+        )
+        self.assertEqual(body["receive_id"], "on_frankie")
+        self.assertEqual(body["uuid"], "r6-202608-finance-gray-001")
+        self.assertEqual(body["msg_type"], "interactive")
+
+    def test_message_body_rejects_invalid_idempotency_uuid(self):
+        card = build_r6_monthly_overview_card("2026-08", [], pending=[])
+        with self.assertRaisesRegex(ValueError, "idempotency"):
+            build_r6_message_body("on_frankie", card, "too-short")
 
     def test_monthly_overview_is_read_only_frankie_card(self):
         card = build_r6_monthly_overview_card(
