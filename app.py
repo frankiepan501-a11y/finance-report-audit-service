@@ -21,6 +21,7 @@ from finance_assistant_r6 import (
     CallbackAuthNotConfigured,
     build_r6_message_body,
     build_r6_monthly_overview_card,
+    r6_send_gate_enabled,
     require_strict_callback_token,
     validate_r6_monthly_card,
 )
@@ -47,6 +48,10 @@ FINANCE_ASSISTANT_APP_ID = os.environ.get("FEISHU_FINANCE_ASSISTANT_APP_ID", "cl
 FINANCE_ASSISTANT_APP_SECRET = os.environ.get("FEISHU_FINANCE_ASSISTANT_APP_SECRET", "")
 FINANCE_ASSISTANT_VERIFICATION_TOKEN = os.environ.get("FEISHU_FINANCE_ASSISTANT_VERIFICATION_TOKEN", "")
 FINANCE_ASSISTANT_ENCRYPT_KEY = os.environ.get("FEISHU_FINANCE_ASSISTANT_ENCRYPT_KEY", "")
+FINANCE_ASSISTANT_R6_AUTH_TOKEN = os.environ.get("FINANCE_ASSISTANT_R6_AUTH_TOKEN", "")
+FINANCE_ASSISTANT_R6_SEND_ENABLED = r6_send_gate_enabled(
+    os.environ.get("FINANCE_ASSISTANT_R6_SEND_ENABLED", "false")
+)
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://finance-report-audit.zeabur.app")
 # 跨境报表名 → 字段名(索引表) 映射(取链接拿token)
 XB_FIELDS = ["亚马逊毛利报表", "沃尔玛毛利报表", "速卖通毛利报表", "TikTok Shop毛利报表",
@@ -3250,9 +3255,11 @@ def _require_internal_auth(request: Request):
 
 
 def _require_r6_internal_auth(request: Request):
-    if not AUTH_TOKEN:
-        raise HTTPException(503, "internal auth token is not configured")
-    if request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
+    if not FINANCE_ASSISTANT_R6_AUTH_TOKEN:
+        _finance_r6_log("auth_config_missing")
+        raise HTTPException(503, "R6 internal auth token is not configured")
+    if request.headers.get("Authorization") != f"Bearer {FINANCE_ASSISTANT_R6_AUTH_TOKEN}":
+        _finance_r6_log("auth_rejected")
         raise HTTPException(401, "unauthorized")
 
 
@@ -3264,12 +3271,27 @@ def _finance_r6_monthly_rows(T, period):
         url = f"{FEISHU}/bitable/v1/apps/{IDX_APP}/tables/{TOTAL_TBL}/records?page_size=500"
         if page_token:
             url += f"&page_token={page_token}"
-        response = requests.get(
-            url,
-            headers={"Authorization": f"Bearer {T}"},
-            timeout=30,
-        ).json()
+        try:
+            raw_response = requests.get(
+                url,
+                headers={"Authorization": f"Bearer {T}"},
+                timeout=30,
+            )
+            response = raw_response.json()
+        except (requests.RequestException, ValueError) as exc:
+            _finance_r6_log(
+                "read_failed",
+                period=period,
+                reason=type(exc).__name__,
+            )
+            raise HTTPException(502, "finance assistant monthly overview read failed") from exc
         if response.get("code") != 0:
+            _finance_r6_log(
+                "read_failed",
+                period=period,
+                feishu_code=response.get("code"),
+                feishu_msg=response.get("msg"),
+            )
             raise HTTPException(502, {
                 "reason": "finance assistant cannot read monthly overview",
                 "feishu_code": response.get("code"),
@@ -3281,6 +3303,7 @@ def _finance_r6_monthly_rows(T, period):
             break
         page_token = data.get("page_token")
         if not page_token:
+            _finance_r6_log("read_failed", period=period, reason="missing_page_token")
             raise HTTPException(502, "Feishu pagination returned has_more without page_token")
 
     rows = []
@@ -3372,10 +3395,13 @@ async def finance_assistant_r5_callback(request: Request):
     try:
         require_strict_callback_token(body, FINANCE_ASSISTANT_VERIFICATION_TOKEN)
     except CallbackAuthNotConfigured as exc:
+        _finance_r6_log("callback_auth_config_missing")
         raise HTTPException(503, str(exc)) from exc
     except CallbackAuthError as exc:
+        _finance_r6_log("callback_auth_rejected")
         raise HTTPException(403, str(exc)) from exc
     if body.get("type") == "url_verification" or body.get("challenge"):
+        _finance_r6_log("callback_challenge_accepted")
         return {"challenge": body.get("challenge", "")}
 
     ctx = callback_context(body)
@@ -3424,6 +3450,23 @@ async def finance_assistant_r5_status(request: Request):
     return _FINANCE_R5_CALLBACKS.status(run_id)
 
 
+@app.get("/finance-assistant/r6/status")
+async def finance_assistant_r6_status(request: Request):
+    """返回 R6 灰度闸状态；不读取飞书、不发送消息。"""
+    _require_r6_internal_auth(request)
+    with _FINANCE_R6_SEND_LOCK:
+        receipt_count = len(_FINANCE_R6_SEND_RECEIPTS)
+    result = {
+        "ok": True,
+        "app_id": FINANCE_ASSISTANT_APP_ID,
+        "send_gate_enabled": FINANCE_ASSISTANT_R6_SEND_ENABLED,
+        "read_only_preflight_enabled": True,
+        "receipt_count": receipt_count,
+    }
+    _finance_r6_log("status_read", **result)
+    return result
+
+
 @app.post("/finance-assistant/r6/monthly-overview")
 async def finance_assistant_r6_monthly_overview(request: Request):
     """读取真实月度汇总；仅在显式 gate 下由财务助手给 Frankie 发 1 张只读卡。"""
@@ -3435,21 +3478,35 @@ async def finance_assistant_r6_monthly_overview(request: Request):
 
     q = request.query_params
     period = str(q.get("period") or _last_month())
-    if not re.fullmatch(r"\d{4}-\d{2}", period):
-        raise HTTPException(400, "period must be YYYY-MM")
     send = q.get("send") == "true"
+    _finance_r6_log("request_received", period=period, send=send)
+    if not re.fullmatch(r"\d{4}-\d{2}", period):
+        _finance_r6_log("validation_rejected", period=period, reason="invalid_period")
+        raise HTTPException(400, "period must be YYYY-MM")
     if send and q.get("gate") != "frankie_only":
+        _finance_r6_log("validation_rejected", period=period, reason="invalid_send_gate")
         raise HTTPException(400, "send=true requires gate=frankie_only")
     if q.get("recipient", "frankie") != "frankie":
+        _finance_r6_log("validation_rejected", period=period, reason="invalid_recipient")
         raise HTTPException(400, "R6 only supports recipient=frankie")
+    if send and not FINANCE_ASSISTANT_R6_SEND_ENABLED:
+        _finance_r6_log("send_blocked", period=period, reason="one_off_gate_closed")
+        raise HTTPException(409, "R6 one-off gray send gate is closed")
 
     T = finance_assistant_tok()
     rows, pending = _finance_r6_monthly_rows(T, period)
     if not rows:
+        _finance_r6_log("validation_rejected", period=period, reason="no_rows")
         raise HTTPException(409, f"no monthly overview rows for {period}")
     card = build_r6_monthly_overview_card(period, rows, pending=pending)
     card_errors = validate_r6_monthly_card(card)
     if card_errors:
+        _finance_r6_log(
+            "validation_rejected",
+            period=period,
+            reason="card_preflight_failed",
+            errors=card_errors,
+        )
         raise HTTPException(500, {"card_preflight_failed": card_errors})
 
     result = {
@@ -3463,10 +3520,17 @@ async def finance_assistant_r6_monthly_overview(request: Request):
         "send": send,
     }
     if not send:
+        _finance_r6_log(
+            "preflight_passed",
+            period=period,
+            rows=len(rows),
+            pending_count=len(pending),
+        )
         return result
 
     idempotency_key = str(q.get("idempotency_key") or "")
     if not re.fullmatch(r"r6-[A-Za-z0-9_-]{12,47}", idempotency_key):
+        _finance_r6_log("validation_rejected", period=period, reason="invalid_idempotency_key")
         raise HTTPException(400, "valid idempotency_key is required")
     with _FINANCE_R6_SEND_LOCK:
         prior_message_id = _FINANCE_R6_SEND_RECEIPTS.get(idempotency_key)
@@ -3483,6 +3547,13 @@ async def finance_assistant_r6_monthly_overview(request: Request):
             return result
     response = _finance_r6_send_card(T, FRANKIE_UNION_ID, card, idempotency_key)
     if response.get("code") != 0:
+        _finance_r6_log(
+            "send_failed",
+            period=period,
+            idempotency_key=idempotency_key,
+            feishu_code=response.get("code"),
+            feishu_msg=response.get("msg"),
+        )
         raise HTTPException(502, {
             "feishu_code": response.get("code"),
             "feishu_msg": response.get("msg"),

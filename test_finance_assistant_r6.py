@@ -7,12 +7,22 @@ from finance_assistant_r6 import (
     CallbackAuthRejected,
     build_r6_message_body,
     build_r6_monthly_overview_card,
+    r6_send_gate_enabled,
     require_strict_callback_token,
     validate_r6_monthly_card,
 )
 
 
 class FinanceAssistantR6Tests(unittest.TestCase):
+    def test_one_off_send_gate_is_closed_by_default(self):
+        self.assertFalse(r6_send_gate_enabled(None))
+        self.assertFalse(r6_send_gate_enabled(""))
+        self.assertFalse(r6_send_gate_enabled("1"))
+
+    def test_one_off_send_gate_only_accepts_explicit_true(self):
+        self.assertTrue(r6_send_gate_enabled("true"))
+        self.assertTrue(r6_send_gate_enabled(" TRUE "))
+
     def test_callback_token_is_mandatory(self):
         with self.assertRaisesRegex(CallbackAuthNotConfigured, "not configured"):
             require_strict_callback_token({"header": {"token": "provided"}}, "")
