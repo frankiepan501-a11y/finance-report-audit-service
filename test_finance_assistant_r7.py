@@ -35,6 +35,7 @@ class FinanceAssistantR7Tests(unittest.TestCase):
                     "sales": 120000,
                     "margin": 24000,
                     "payback": 100000,
+                    "owners": [("ou_owner", "渠道负责人")],
                 }
             ],
             pending=["TEMU"],
@@ -43,6 +44,10 @@ class FinanceAssistantR7Tests(unittest.TestCase):
         serialized = str(card)
         self.assertIn("[FIN·P2]", card["header"]["title"]["content"])
         self.assertIn("全渠道毛利月度汇报", serialized)
+        self.assertIn("负责人", serialized)
+        self.assertIn("渠道负责人", serialized)
+        self.assertIn("审计未过/报表0", serialized)
+        self.assertIn("跨境=领星实数", serialized)
         self.assertNotIn("R6", serialized)
         self.assertNotIn("只读灰度", serialized)
         self.assertNotIn("button", serialized)

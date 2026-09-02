@@ -3595,7 +3595,7 @@ async def finance_assistant_r6_monthly_overview(request: Request):
     return result
 
 
-def _finance_r7_send_card(T, receive_id_type, receive_id, card, period, kind):
+def _finance_r7_send_card(tenant_access_token, receive_id_type, receive_id, card, period, kind):
     body = build_r7_message_body(
         receive_id_type,
         receive_id,
@@ -3606,7 +3606,7 @@ def _finance_r7_send_card(T, receive_id_type, receive_id, card, period, kind):
     try:
         response = requests.post(
             f"{FEISHU}/im/v1/messages?receive_id_type={receive_id_type}",
-            headers={"Authorization": f"Bearer {T}", "Content-Type": "application/json"},
+            headers={"Authorization": f"Bearer {tenant_access_token}", "Content-Type": "application/json"},
             json=body,
             timeout=20,
         ).json()
@@ -3666,11 +3666,6 @@ def _finance_r7_monthly_report(period, mode):
             "sent": False,
         }
 
-    overview = build_r7_monthly_overview_card(period, rows, pending=pending)
-    card_errors = validate_r7_monthly_card(overview)
-    if card_errors:
-        raise HTTPException(500, {"card_preflight_failed": card_errors})
-
     legacy_token = tok()
     _dept_jt_cache.clear()
     channel_plans = []
@@ -3685,6 +3680,11 @@ def _finance_r7_monthly_report(period, mode):
             "owners": _resolve_owners(legacy_token, platform),
         })
         channel_plans.append(plan)
+
+    overview = build_r7_monthly_overview_card(period, channel_plans, pending=pending)
+    card_errors = validate_r7_monthly_card(overview)
+    if card_errors:
+        raise HTTPException(500, {"card_preflight_failed": card_errors})
 
     result = {
         "ok": True,

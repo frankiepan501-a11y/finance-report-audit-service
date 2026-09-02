@@ -48,22 +48,32 @@ def build_r7_monthly_overview_card(
     total_margin = sum(float(row.get("margin") or 0) for row in normalized)
     margin_rate = (total_margin / total_sales * 100) if total_sales else 0
 
-    lines = ["**渠道 / 店铺 | 销售额 | 毛利润 | 毛利率 | 回款**"]
+    lines = ["**渠道 / 店铺 | 销售额 | 毛利润 | 毛利率 | 回款 | 负责人**"]
     for row in normalized:
         sales = float(row.get("sales") or 0)
         margin = float(row.get("margin") or 0)
         rate = (margin / sales * 100) if sales else 0
         payback = row.get("payback")
         payback_text = _money(payback) if payback is not None else "—"
+        owner_names = [
+            str(item[1])
+            for item in (row.get("owners") or [])
+            if isinstance(item, (list, tuple)) and len(item) > 1 and str(item[1])
+        ]
+        owners_text = "/".join(owner_names) or "—"
         lines.append(
             f"{row.get('platform') or '—'} / {row.get('shop') or '—'} | "
-            f"{_money(sales)} | {_money(margin)} | {rate:.1f}% | {payback_text}"
+            f"{_money(sales)} | {_money(margin)} | {rate:.1f}% | {payback_text} | {owners_text}"
         )
     lines.append(
-        f"**合计 | {_money(total_sales)} | {_money(total_margin)} | {margin_rate:.1f}% | —**"
+        f"**合计 | {_money(total_sales)} | {_money(total_margin)} | {margin_rate:.1f}% | — | —**"
     )
     pending_items = [str(item) for item in pending if str(item)]
-    pending_text = "、".join(pending_items) if pending_items else "无"
+    pending_text = (
+        "、".join(pending_items) + "（审计未过/报表0，见审计卡，修复后次日自动灌）"
+        if pending_items
+        else "无"
+    )
 
     return {
         "config": {"wide_screen_mode": True, "enable_forward": False},
@@ -89,7 +99,7 @@ def build_r7_monthly_overview_card(
                     "tag": "lark_md",
                     "content": (
                         f"**待核未灌**：{pending_text}\n\n"
-                        "📊 仅汇总已通过审计并进入总表的数据。回款列按各渠道当前财务口径展示。"
+                        "📊 已审过才灌总表。回款列：跨境=领星实数，美客多/国内电商待财务口径。"
                     ),
                 },
             },
