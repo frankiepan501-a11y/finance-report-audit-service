@@ -3,6 +3,7 @@ import unittest
 
 from finance_assistant_r5 import (
     R5CallbackRegistry,
+    build_r5_callback_response,
     build_r5_result_card,
     build_r5_test_card,
     callback_context,
@@ -35,6 +36,13 @@ class FinanceAssistantR5CardTests(unittest.TestCase):
         self.assertEqual(card["header"]["template"], "green")
         self.assertFalse(any(x.get("tag") == "button" for x in card["body"]["elements"]))
         self.assertEqual(validate_r5_card(card), [])
+
+    def test_callback_response_updates_the_original_card(self):
+        response = build_r5_callback_response("r5-run", "2026-09-02 19:30:00")
+
+        self.assertEqual(response["toast"]["type"], "success")
+        self.assertEqual(response["card"]["schema"], "2.0")
+        self.assertFalse(any(x.get("tag") == "button" for x in response["card"]["body"]["elements"]))
 
 
 class FinanceAssistantR5CallbackTests(unittest.TestCase):

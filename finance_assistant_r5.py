@@ -147,6 +147,16 @@ def build_r5_result_card(run_id: str, processed_at: str, *, duplicate: bool = Fa
     return card
 
 
+def build_r5_callback_response(run_id: str, processed_at: str, *, duplicate: bool = False) -> Dict[str, Any]:
+    return {
+        "toast": {
+            "type": "success",
+            "content": "回调验证完成，无财务数据变更。",
+        },
+        "card": build_r5_result_card(run_id, processed_at, duplicate=duplicate),
+    }
+
+
 def _deep_get(obj: Dict[str, Any], *path: str) -> Any:
     current: Any = obj
     for key in path:

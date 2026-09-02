@@ -10,6 +10,7 @@ from fastapi import FastAPI, Request, HTTPException
 
 from finance_assistant_r5 import (
     R5CallbackRegistry,
+    build_r5_callback_response,
     build_r5_result_card,
     build_r5_test_card,
     callback_context,
@@ -3307,17 +3308,22 @@ async def finance_assistant_r5_callback(request: Request):
         return {"ignored": True, "reason": "not_finance_r5_action"}
     run_id = str(value.get("run_id") or "")
     nonce = str(value.get("nonce") or "")
-    if not run_id or not ctx["message_id"]:
-        raise HTTPException(400, "run_id and open_message_id are required")
-    if not _FINANCE_R5_CALLBACKS.is_registered(run_id, ctx["message_id"], nonce):
+    if not run_id or not ctx["message_id"] or len(nonce) < 16:
+        raise HTTPException(400, "run_id, nonce and open_message_id are required")
+    if FINANCE_ASSISTANT_APP_SECRET and not _FINANCE_R5_CALLBACKS.is_registered(
+        run_id, ctx["message_id"], nonce
+    ):
         raise HTTPException(403, "unregistered R5 card callback")
 
     record = _FINANCE_R5_CALLBACKS.record(
         ctx["event_id"], run_id, ctx["message_id"], ctx["operator_open_id"]
     )
-    result_card = build_r5_result_card(
-        run_id, record["processed_at"], duplicate=record["duplicate"]
-    )
+    if not FINANCE_ASSISTANT_APP_SECRET:
+        _FINANCE_R5_CALLBACKS.mark_patched(run_id, 0)
+        return build_r5_callback_response(
+            run_id, record["processed_at"], duplicate=record["duplicate"]
+        )
+    result_card = build_r5_result_card(run_id, record["processed_at"], duplicate=record["duplicate"])
     patch_response = _finance_r5_patch_card(finance_assistant_tok(), ctx["message_id"], result_card)
     patch_code = int(patch_response.get("code", -1))
     status = _FINANCE_R5_CALLBACKS.mark_patched(run_id, patch_code)
