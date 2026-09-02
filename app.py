@@ -3,10 +3,20 @@
 检查: 数据缺漏(空报表) / 采购成本覆盖(有销售但cg=0) / 物流头程覆盖。
 异常 → 飞书卡片发财务部 + Frankie, 列 渠道/店铺/负责人/异常, 让财务跟运营核实。
 口径: 只 flag「销售额>0 且 成本=0」(真异常); 销售=0的0成本行忽略。"""
-import os, json, datetime, hashlib, time, re, threading
+import os, json, datetime, hashlib, time, re, threading, uuid
 from collections import defaultdict
 import requests
 from fastapi import FastAPI, Request, HTTPException
+
+from finance_assistant_r5 import (
+    R5CallbackRegistry,
+    build_r5_result_card,
+    build_r5_test_card,
+    callback_context,
+    callback_token,
+    valid_callback_token,
+    validate_r5_card,
+)
 
 APP_ID = os.environ["FEISHU_APP_ID"]      # 聪哥1号
 APP_SECRET = os.environ["FEISHU_APP_SECRET"]
@@ -26,6 +36,10 @@ EVENT_APP_ID = os.environ.get("FEISHU_EVENT_APP_ID", APP_ID)       # 聪哥3号:
 EVENT_APP_SECRET = os.environ.get("FEISHU_EVENT_APP_SECRET", "")
 if not EVENT_APP_SECRET:
     EVENT_APP_ID, EVENT_APP_SECRET = APP_ID, APP_SECRET
+FINANCE_ASSISTANT_APP_ID = os.environ.get("FEISHU_FINANCE_ASSISTANT_APP_ID", "cli_aa1d52694f61dbc1")
+FINANCE_ASSISTANT_APP_SECRET = os.environ.get("FEISHU_FINANCE_ASSISTANT_APP_SECRET", "")
+FINANCE_ASSISTANT_VERIFICATION_TOKEN = os.environ.get("FEISHU_FINANCE_ASSISTANT_VERIFICATION_TOKEN", "")
+FINANCE_ASSISTANT_ENCRYPT_KEY = os.environ.get("FEISHU_FINANCE_ASSISTANT_ENCRYPT_KEY", "")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://finance-report-audit.zeabur.app")
 # 跨境报表名 → 字段名(索引表) 映射(取链接拿token)
 XB_FIELDS = ["亚马逊毛利报表", "沃尔玛毛利报表", "速卖通毛利报表", "TikTok Shop毛利报表",
@@ -65,6 +79,7 @@ N8N_API_BASE_URL = _N8N_API_BASE
 N8N_API_KEY = os.environ.get("N8N_API_KEY", "")
 _COMPANY_ASYNC_JOBS = {}
 _COMPANY_ASYNC_LOCK = threading.Lock()
+_FINANCE_R5_CALLBACKS = R5CallbackRegistry()
 
 COMPANY_PLATFORM_REGISTRY = {
     "amazon": {"name": "Amazon", "platform": "亚马逊", "site": "亚马逊全站", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部", "maturity": "confirmed", "generator_type": "n8n_webhook", "workflow_id": "CyapOmKK0hyIJoXY", "generator_method": "GET", "generator_path": "trigger-amazon-profit"},
@@ -124,6 +139,12 @@ def tok():
 
 def event_tok():
     return _tok_for(EVENT_APP_ID, EVENT_APP_SECRET)
+
+
+def finance_assistant_tok():
+    if not FINANCE_ASSISTANT_APP_ID or not FINANCE_ASSISTANT_APP_SECRET:
+        raise HTTPException(503, "finance assistant credentials are not configured")
+    return _tok_for(FINANCE_ASSISTANT_APP_ID, FINANCE_ASSISTANT_APP_SECRET)
 
 
 def num(x):
@@ -3195,6 +3216,125 @@ async def profit_workflow_callback(request: Request):
         raise HTTPException(401, "unauthorized")
     body = await request.json()
     return _handle_company_callback(body)
+
+
+def _require_internal_auth(request: Request):
+    if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
+        raise HTTPException(401, "unauthorized")
+
+
+def _finance_r5_send_card(T, card):
+    return requests.post(
+        f"{FEISHU}/im/v1/messages?receive_id_type=union_id",
+        headers={"Authorization": f"Bearer {T}", "Content-Type": "application/json"},
+        json={
+            "receive_id": FRANKIE_UNION_ID,
+            "msg_type": "interactive",
+            "content": json.dumps(card, ensure_ascii=False),
+        },
+        timeout=20,
+    ).json()
+
+
+def _finance_r5_patch_card(T, message_id, card):
+    return requests.patch(
+        f"{FEISHU}/im/v1/messages/{message_id}",
+        headers={"Authorization": f"Bearer {T}", "Content-Type": "application/json"},
+        json={"content": json.dumps(card, ensure_ascii=False)},
+        timeout=20,
+    ).json()
+
+
+@app.post("/finance-assistant/r5/preflight")
+async def finance_assistant_r5_preflight(request: Request):
+    """验证新 App 凭据可取 token；不发送消息、不读写财务资源。"""
+    _require_internal_auth(request)
+    if FINANCE_ASSISTANT_ENCRYPT_KEY:
+        raise HTTPException(409, "encrypted callbacks are not supported in R5")
+    finance_assistant_tok()
+    return {
+        "ok": True,
+        "app_id": FINANCE_ASSISTANT_APP_ID,
+        "callback_path": "/finance-assistant/r5/callback",
+        "verification_token_configured": bool(FINANCE_ASSISTANT_VERIFICATION_TOKEN),
+        "encrypted_callback": False,
+    }
+
+
+@app.post("/finance-assistant/r5/sample")
+async def finance_assistant_r5_sample(request: Request):
+    """只给 Frankie 发一张无业务副作用的 R5 测试卡。"""
+    _require_internal_auth(request)
+    if not FINANCE_ASSISTANT_VERIFICATION_TOKEN:
+        raise HTTPException(503, "finance assistant verification token is not configured")
+    run_id = f"r5-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    card = build_r5_test_card(run_id)
+    card_errors = validate_r5_card(card)
+    if card_errors:
+        raise HTTPException(500, {"card_preflight_failed": card_errors})
+    response = _finance_r5_send_card(finance_assistant_tok(), card)
+    if response.get("code") != 0:
+        raise HTTPException(502, {"feishu_code": response.get("code"), "feishu_msg": response.get("msg")})
+    message_id = (response.get("data") or {}).get("message_id") or ""
+    _FINANCE_R5_CALLBACKS.register_sent(run_id, message_id)
+    return {
+        "ok": True,
+        "app_id": FINANCE_ASSISTANT_APP_ID,
+        "recipient": "Frankie-only",
+        "run_id": run_id,
+        "message_id": message_id,
+    }
+
+
+@app.post("/finance-assistant/r5/callback")
+async def finance_assistant_r5_callback(request: Request):
+    """财务助手自己的 card.action.trigger 回调；不经过旧事件 App。"""
+    body = await request.json()
+    if body.get("encrypt"):
+        raise HTTPException(400, "encrypted callbacks are not supported in R5")
+    if not FINANCE_ASSISTANT_VERIFICATION_TOKEN:
+        raise HTTPException(503, "finance assistant verification token is not configured")
+    if not valid_callback_token(callback_token(body), FINANCE_ASSISTANT_VERIFICATION_TOKEN):
+        raise HTTPException(403, "invalid callback token")
+    if body.get("type") == "url_verification" or body.get("challenge"):
+        return {"challenge": body.get("challenge", "")}
+
+    ctx = callback_context(body)
+    value = ctx["value"]
+    if value.get("action") != "finance_r5_ack" or value.get("schema") != "finance_assistant_r5_v1":
+        return {"ignored": True, "reason": "not_finance_r5_action"}
+    run_id = str(value.get("run_id") or "")
+    if not run_id or not ctx["message_id"]:
+        raise HTTPException(400, "run_id and open_message_id are required")
+
+    record = _FINANCE_R5_CALLBACKS.record(
+        ctx["event_id"], run_id, ctx["message_id"], ctx["operator_open_id"]
+    )
+    result_card = build_r5_result_card(
+        run_id, record["processed_at"], duplicate=record["duplicate"]
+    )
+    patch_response = _finance_r5_patch_card(finance_assistant_tok(), ctx["message_id"], result_card)
+    patch_code = int(patch_response.get("code", -1))
+    status = _FINANCE_R5_CALLBACKS.mark_patched(run_id, patch_code)
+    if patch_code != 0:
+        raise HTTPException(502, {"feishu_code": patch_code, "feishu_msg": patch_response.get("msg")})
+    return {
+        "ok": True,
+        "app_id": FINANCE_ASSISTANT_APP_ID,
+        "run_id": run_id,
+        "duplicate": record["duplicate"],
+        "patched_original_card": True,
+        "status": status["status"],
+    }
+
+
+@app.get("/finance-assistant/r5/status")
+async def finance_assistant_r5_status(request: Request):
+    _require_internal_auth(request)
+    run_id = str(request.query_params.get("run_id") or "")
+    if not run_id:
+        raise HTTPException(400, "run_id is required")
+    return _FINANCE_R5_CALLBACKS.status(run_id)
 
 
 @app.get("/health")
