@@ -18,6 +18,12 @@ from finance_assistant_r5 import (
     valid_callback_token,
     validate_r5_card,
 )
+from finance_assistant_r6 import (
+    CallbackAuthError,
+    build_r6_monthly_overview_card,
+    require_strict_callback_token,
+    validate_r6_monthly_card,
+)
 
 APP_ID = os.environ["FEISHU_APP_ID"]      # 聪哥1号
 APP_SECRET = os.environ["FEISHU_APP_SECRET"]
@@ -81,6 +87,8 @@ N8N_API_KEY = os.environ.get("N8N_API_KEY", "")
 _COMPANY_ASYNC_JOBS = {}
 _COMPANY_ASYNC_LOCK = threading.Lock()
 _FINANCE_R5_CALLBACKS = R5CallbackRegistry()
+_FINANCE_R6_SEND_KEYS = set()
+_FINANCE_R6_SEND_LOCK = threading.Lock()
 
 COMPANY_PLATFORM_REGISTRY = {
     "amazon": {"name": "Amazon", "platform": "亚马逊", "site": "亚马逊全站", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部", "maturity": "confirmed", "generator_type": "n8n_webhook", "workflow_id": "CyapOmKK0hyIJoXY", "generator_method": "GET", "generator_path": "trigger-amazon-profit"},
@@ -3224,6 +3232,58 @@ def _require_internal_auth(request: Request):
         raise HTTPException(401, "unauthorized")
 
 
+def _require_r6_internal_auth(request: Request):
+    if not AUTH_TOKEN:
+        raise HTTPException(503, "internal auth token is not configured")
+    if request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
+        raise HTTPException(401, "unauthorized")
+
+
+def _finance_r6_monthly_rows(T, period):
+    """使用财务助手身份只读汇总表；任何 API 错误都显式失败。"""
+    records = []
+    page_token = None
+    while True:
+        url = f"{FEISHU}/bitable/v1/apps/{IDX_APP}/tables/{TOTAL_TBL}/records?page_size=500"
+        if page_token:
+            url += f"&page_token={page_token}"
+        response = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {T}"},
+            timeout=30,
+        ).json()
+        if response.get("code") != 0:
+            raise HTTPException(502, {
+                "reason": "finance assistant cannot read monthly overview",
+                "feishu_code": response.get("code"),
+                "feishu_msg": response.get("msg"),
+            })
+        data = response.get("data") or {}
+        records.extend(data.get("items") or [])
+        if not data.get("has_more"):
+            break
+        page_token = data.get("page_token")
+        if not page_token:
+            raise HTTPException(502, "Feishu pagination returned has_more without page_token")
+
+    rows = []
+    for record in records:
+        fields = record.get("fields") or {}
+        if ft(fields.get("月份")) != period:
+            continue
+        rows.append({
+            "platform": ft(fields.get("平台")) or ft(fields.get("渠道大类")),
+            "shop": ft(fields.get("店铺")),
+            "sales": _aggnum(fields.get("销售额RMB")),
+            "margin": _aggnum(fields.get("全额毛利RMB")),
+            "payback": _aggnum(fields.get("回款RMB")) if fields.get("回款RMB") not in (None, "") else None,
+        })
+    rows.sort(key=lambda row: (-row["margin"], row["platform"], row["shop"]))
+    present = {row["shop"] for row in rows}
+    pending = [shop for (_, _, _, shop, _, _) in AGG_REPORTS if shop not in present]
+    return rows, pending
+
+
 def _finance_r5_send_card(T, card):
     return requests.post(
         f"{FEISHU}/im/v1/messages?receive_id_type=union_id",
@@ -3294,13 +3354,11 @@ async def finance_assistant_r5_callback(request: Request):
         raise HTTPException(400, "encrypted callbacks are not supported in R5")
     if body.get("type") == "url_verification" or body.get("challenge"):
         return {"challenge": body.get("challenge", "")}
-    strict_token_configured = bool(
-        re.fullmatch(r"[A-Za-z0-9_-]{16,128}", FINANCE_ASSISTANT_VERIFICATION_TOKEN or "")
-    )
-    if strict_token_configured and not valid_callback_token(
-        callback_token(body), FINANCE_ASSISTANT_VERIFICATION_TOKEN
-    ):
-        raise HTTPException(403, "invalid callback token")
+    try:
+        require_strict_callback_token(body, FINANCE_ASSISTANT_VERIFICATION_TOKEN)
+    except CallbackAuthError as exc:
+        status_code = 503 if "not configured" in str(exc) else 403
+        raise HTTPException(status_code, str(exc)) from exc
 
     ctx = callback_context(body)
     value = ctx["value"]
@@ -3346,6 +3404,74 @@ async def finance_assistant_r5_status(request: Request):
     if not run_id:
         raise HTTPException(400, "run_id is required")
     return _FINANCE_R5_CALLBACKS.status(run_id)
+
+
+@app.post("/finance-assistant/r6/monthly-overview")
+async def finance_assistant_r6_monthly_overview(request: Request):
+    """读取真实月度汇总；仅在显式 gate 下由财务助手给 Frankie 发 1 张只读卡。"""
+    _require_r6_internal_auth(request)
+    if FINANCE_ASSISTANT_ENCRYPT_KEY:
+        raise HTTPException(409, "encrypted callbacks are not supported in R6")
+    if not FINANCE_ASSISTANT_VERIFICATION_TOKEN:
+        raise HTTPException(503, "finance assistant callback verification token is not configured")
+
+    q = request.query_params
+    period = str(q.get("period") or _last_month())
+    if not re.fullmatch(r"\d{4}-\d{2}", period):
+        raise HTTPException(400, "period must be YYYY-MM")
+    send = q.get("send") == "true"
+    if send and q.get("gate") != "frankie_only":
+        raise HTTPException(400, "send=true requires gate=frankie_only")
+    if q.get("recipient", "frankie") != "frankie":
+        raise HTTPException(400, "R6 only supports recipient=frankie")
+
+    T = finance_assistant_tok()
+    rows, pending = _finance_r6_monthly_rows(T, period)
+    if not rows:
+        raise HTTPException(409, f"no monthly overview rows for {period}")
+    card = build_r6_monthly_overview_card(period, rows, pending=pending)
+    card_errors = validate_r6_monthly_card(card)
+    if card_errors:
+        raise HTTPException(500, {"card_preflight_failed": card_errors})
+
+    result = {
+        "ok": True,
+        "app_id": FINANCE_ASSISTANT_APP_ID,
+        "period": period,
+        "rows": len(rows),
+        "pending_count": len(pending),
+        "recipient": "Frankie-only",
+        "read_only": True,
+        "send": send,
+    }
+    if not send:
+        return result
+
+    idempotency_key = str(q.get("idempotency_key") or "")
+    if not re.fullmatch(r"r6-[A-Za-z0-9_-]{12,80}", idempotency_key):
+        raise HTTPException(400, "valid idempotency_key is required")
+    with _FINANCE_R6_SEND_LOCK:
+        if idempotency_key in _FINANCE_R6_SEND_KEYS:
+            result.update({"duplicate": True, "sent": False})
+            return result
+        _FINANCE_R6_SEND_KEYS.add(idempotency_key)
+    try:
+        response = _send_event_card_union(T, FRANKIE_UNION_ID, card)
+        if response.get("code") != 0:
+            raise HTTPException(502, {
+                "feishu_code": response.get("code"),
+                "feishu_msg": response.get("msg"),
+            })
+    except Exception:
+        with _FINANCE_R6_SEND_LOCK:
+            _FINANCE_R6_SEND_KEYS.discard(idempotency_key)
+        raise
+    result.update({
+        "sent": True,
+        "message_id": (response.get("data") or {}).get("message_id") or "",
+        "idempotency_key": idempotency_key,
+    })
+    return result
 
 
 @app.get("/health")
