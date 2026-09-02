@@ -49,11 +49,6 @@ def build_r6_message_body(
     }
 
 
-def r6_send_gate_enabled(value: Any) -> bool:
-    """R6 是一次性灰度：只有明确配置为 true 时才允许发卡。"""
-    return str(value or "").strip().lower() == "true"
-
-
 def _money(value: Any) -> str:
     try:
         return f"¥{float(value or 0):,.0f}"

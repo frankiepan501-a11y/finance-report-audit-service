@@ -21,7 +21,6 @@ from finance_assistant_r6 import (
     CallbackAuthNotConfigured,
     build_r6_message_body,
     build_r6_monthly_overview_card,
-    r6_send_gate_enabled,
     require_strict_callback_token,
     validate_r6_monthly_card,
 )
@@ -49,9 +48,8 @@ FINANCE_ASSISTANT_APP_SECRET = os.environ.get("FEISHU_FINANCE_ASSISTANT_APP_SECR
 FINANCE_ASSISTANT_VERIFICATION_TOKEN = os.environ.get("FEISHU_FINANCE_ASSISTANT_VERIFICATION_TOKEN", "")
 FINANCE_ASSISTANT_ENCRYPT_KEY = os.environ.get("FEISHU_FINANCE_ASSISTANT_ENCRYPT_KEY", "")
 FINANCE_ASSISTANT_R6_AUTH_TOKEN = os.environ.get("FINANCE_ASSISTANT_R6_AUTH_TOKEN", "")
-FINANCE_ASSISTANT_R6_SEND_ENABLED = r6_send_gate_enabled(
-    os.environ.get("FINANCE_ASSISTANT_R6_SEND_ENABLED", "false")
-)
+# R6 的唯一真实灰度卡已经发出。此常量永久锁死，避免重启、超时或误配后再次发送。
+FINANCE_ASSISTANT_R6_SEND_ENABLED = False
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://finance-report-audit.zeabur.app")
 # 跨境报表名 → 字段名(索引表) 映射(取链接拿token)
 XB_FIELDS = ["亚马逊毛利报表", "沃尔玛毛利报表", "速卖通毛利报表", "TikTok Shop毛利报表",
@@ -3472,8 +3470,10 @@ async def finance_assistant_r6_monthly_overview(request: Request):
     """读取真实月度汇总；仅在显式 gate 下由财务助手给 Frankie 发 1 张只读卡。"""
     _require_r6_internal_auth(request)
     if FINANCE_ASSISTANT_ENCRYPT_KEY:
+        _finance_r6_log("validation_rejected", reason="encrypted_callback_configured")
         raise HTTPException(409, "encrypted callbacks are not supported in R6")
     if not FINANCE_ASSISTANT_VERIFICATION_TOKEN:
+        _finance_r6_log("validation_rejected", reason="verification_token_missing")
         raise HTTPException(503, "finance assistant callback verification token is not configured")
 
     q = request.query_params
@@ -3493,7 +3493,14 @@ async def finance_assistant_r6_monthly_overview(request: Request):
         _finance_r6_log("send_blocked", period=period, reason="one_off_gate_closed")
         raise HTTPException(409, "R6 one-off gray send gate is closed")
 
-    T = finance_assistant_tok()
+    try:
+        T = finance_assistant_tok()
+    except HTTPException as exc:
+        _finance_r6_log("token_failed", period=period, status_code=exc.status_code)
+        raise
+    except (requests.RequestException, ValueError, KeyError) as exc:
+        _finance_r6_log("token_failed", period=period, reason=type(exc).__name__)
+        raise HTTPException(502, "finance assistant token request failed") from exc
     rows, pending = _finance_r6_monthly_rows(T, period)
     if not rows:
         _finance_r6_log("validation_rejected", period=period, reason="no_rows")
@@ -3545,7 +3552,16 @@ async def finance_assistant_r6_monthly_overview(request: Request):
                             pending_count=len(pending), idempotency_key=idempotency_key,
                             message_id=prior_message_id)
             return result
-    response = _finance_r6_send_card(T, FRANKIE_UNION_ID, card, idempotency_key)
+    try:
+        response = _finance_r6_send_card(T, FRANKIE_UNION_ID, card, idempotency_key)
+    except (requests.RequestException, ValueError) as exc:
+        _finance_r6_log(
+            "send_failed",
+            period=period,
+            idempotency_key=idempotency_key,
+            reason=type(exc).__name__,
+        )
+        raise HTTPException(502, "finance assistant card send failed") from exc
     if response.get("code") != 0:
         _finance_r6_log(
             "send_failed",
