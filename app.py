@@ -24,10 +24,18 @@ from finance_assistant_r6 import (
     require_strict_callback_token,
     validate_r6_monthly_card,
 )
+from finance_assistant_r7 import (
+    build_r7_message_body,
+    build_r7_monthly_overview_card,
+    service_auth_matches,
+    validate_r7_mode,
+    validate_r7_monthly_card,
+)
 
 APP_ID = os.environ["FEISHU_APP_ID"]      # 聪哥1号
 APP_SECRET = os.environ["FEISHU_APP_SECRET"]
 AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "")
+FINANCE_REPORT_AUDIT_API_TOKEN = os.environ.get("FINANCE_REPORT_AUDIT_API_TOKEN", "")
 FEISHU = "https://open.feishu.cn/open-apis"
 app = FastAPI()
 
@@ -50,6 +58,9 @@ FINANCE_ASSISTANT_ENCRYPT_KEY = os.environ.get("FEISHU_FINANCE_ASSISTANT_ENCRYPT
 FINANCE_ASSISTANT_R6_AUTH_TOKEN = os.environ.get("FINANCE_ASSISTANT_R6_AUTH_TOKEN", "")
 # R6 的唯一真实灰度卡已经发出。此常量永久锁死，避免重启、超时或误配后再次发送。
 FINANCE_ASSISTANT_R6_SEND_ENABLED = False
+FINANCE_REPORT_CHAT_ID = os.environ.get(
+    "FINANCE_REPORT_CHAT_ID", "oc_6b2da626d80eb6284bbe9dcf895030b9"
+)
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://finance-report-audit.zeabur.app")
 # 跨境报表名 → 字段名(索引表) 映射(取链接拿token)
 XB_FIELDS = ["亚马逊毛利报表", "沃尔玛毛利报表", "速卖通毛利报表", "TikTok Shop毛利报表",
@@ -637,8 +648,7 @@ def do_grant():
 
 @app.post("/grant")
 async def grant(request: Request):
-    if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
-        raise HTTPException(401, "unauthorized")
+    _require_internal_auth(request)
     return do_grant()
 
 
@@ -1606,8 +1616,7 @@ def do_aggregate():
 
 @app.post("/aggregate")
 async def aggregate(request: Request):
-    if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
-        raise HTTPException(401, "unauthorized")
+    _require_internal_auth(request)
     return do_aggregate()
 
 
@@ -2871,8 +2880,7 @@ def _last_month():
 
 @app.post("/report-monthly")
 async def report_monthly(request: Request):
-    if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
-        raise HTTPException(401, "unauthorized")
+    _require_internal_auth(request)
     q = request.query_params
     return _monthly_report(frankie_only=q.get("frankie_only") == "true", dry_run=q.get("dry_run") == "true")
 
@@ -2880,8 +2888,7 @@ async def report_monthly(request: Request):
 @app.post("/profit-workflow/seed")
 async def profit_workflow_seed(request: Request):
     """Seed company-level gross-profit workflow runs into Finance Base ledger."""
-    if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
-        raise HTTPException(401, "unauthorized")
+    _require_internal_auth(request)
     q = request.query_params
     period = q.get("period") or _last_month()
     platform = q.get("platform")
@@ -2898,8 +2905,7 @@ async def profit_workflow_seed(request: Request):
 @app.get("/profit-workflow/generators")
 async def profit_workflow_generators(request: Request):
     """Read-only generator registry audit. Does not trigger any external workflow."""
-    if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
-        raise HTTPException(401, "unauthorized")
+    _require_internal_auth(request)
     q = request.query_params
     period = q.get("period") or _last_month()
     scope = q.get("scope") or "v1"
@@ -2925,8 +2931,7 @@ async def profit_workflow_generators(request: Request):
 @app.post("/profit-workflow/run-month")
 async def profit_workflow_run_month(request: Request):
     """Production-oriented monthly orchestrator: seed runs, run AI initial audit, then route P0 or finance cards."""
-    if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
-        raise HTTPException(401, "unauthorized")
+    _require_internal_auth(request)
     q = request.query_params
     period = q.get("period") or _last_month()
     report_period = q.get("report_period")
@@ -3021,8 +3026,7 @@ async def profit_workflow_run_month(request: Request):
 @app.post("/profit-workflow/rerun")
 async def profit_workflow_rerun(request: Request):
     """Rerun one company-profit run after P0补件/例外处理; optionally send the next Frankie-only/gray card."""
-    if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
-        raise HTTPException(401, "unauthorized")
+    _require_internal_auth(request)
     q = request.query_params
     run_id = q.get("run_id")
     if not run_id:
@@ -3087,8 +3091,7 @@ async def profit_workflow_rerun(request: Request):
 @app.post("/profit-workflow/owner-gap-cards")
 async def profit_workflow_owner_gap_cards(request: Request):
     """Split P0 cost gaps by report owner and optionally send operation cards."""
-    if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
-        raise HTTPException(401, "unauthorized")
+    _require_internal_auth(request)
     q = request.query_params
     run_id = q.get("run_id")
     period = q.get("period") or _last_month()
@@ -3131,8 +3134,7 @@ async def profit_workflow_owner_gap_cards(request: Request):
 @app.api_route("/profit-workflow/poll-run", methods=["GET", "POST"])
 async def profit_workflow_poll_run(request: Request):
     """Poll one run after async generation. Optional reconcile=true refreshes report link and runs AI audit."""
-    if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
-        raise HTTPException(401, "unauthorized")
+    _require_internal_auth(request)
     q = request.query_params
     run_id = q.get("run_id")
     if not run_id:
@@ -3176,8 +3178,7 @@ async def profit_workflow_poll_run(request: Request):
 @app.post("/profit-workflow/test-cards")
 async def profit_workflow_test_cards(request: Request):
     """P0 smoke: create Base ledger rows and optionally send sample cards to Frankie only."""
-    if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
-        raise HTTPException(401, "unauthorized")
+    _require_internal_auth(request)
     q = request.query_params
     period = q.get("period") or _last_month()
     report_period = q.get("report_period")
@@ -3241,14 +3242,19 @@ async def profit_workflow_test_cards(request: Request):
 @app.post("/profit-workflow/callback")
 async def profit_workflow_callback(request: Request):
     """n8n Event Hub forwards company_profit_* card.action.trigger payloads here."""
-    if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
-        raise HTTPException(401, "unauthorized")
+    _require_internal_auth(request)
     body = await request.json()
     return _handle_company_callback(body)
 
 
 def _require_internal_auth(request: Request):
-    if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
+    if not FINANCE_REPORT_AUDIT_API_TOKEN and not AUTH_TOKEN:
+        raise HTTPException(503, "finance report service auth is not configured")
+    if not service_auth_matches(
+        request.headers.get("Authorization", ""),
+        FINANCE_REPORT_AUDIT_API_TOKEN,
+        AUTH_TOKEN,
+    ):
         raise HTTPException(401, "unauthorized")
 
 
@@ -3589,12 +3595,187 @@ async def finance_assistant_r6_monthly_overview(request: Request):
     return result
 
 
+def _finance_r7_send_card(T, receive_id_type, receive_id, card, period, kind):
+    body = build_r7_message_body(
+        receive_id_type,
+        receive_id,
+        card,
+        period=period,
+        kind=kind,
+    )
+    try:
+        response = requests.post(
+            f"{FEISHU}/im/v1/messages?receive_id_type={receive_id_type}",
+            headers={"Authorization": f"Bearer {T}", "Content-Type": "application/json"},
+            json=body,
+            timeout=20,
+        ).json()
+    except (requests.RequestException, ValueError) as exc:
+        raise HTTPException(502, "finance assistant R7 card send failed") from exc
+    return {
+        "code": int(response.get("code", -1)),
+        "message_id": (response.get("data") or {}).get("message_id") or "",
+        "msg": response.get("msg") or "",
+    }
+
+
+def _finance_r7_channel_card(period, row):
+    payback = (
+        f" · 回款 ¥{_fmt(row['payback'])}"
+        if row.get("payback") is not None
+        else ""
+    )
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "turquoise",
+            "title": {
+                "tag": "plain_text",
+                "content": f"🟡 [FIN·P2] {row['platform']}毛利月度汇报 · {period}",
+            },
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": (
+                        f"**{row['platform']}**（{row['shop']}）\n"
+                        f"销售 **¥{_fmt(row['sales'])}** · "
+                        f"毛利 **¥{_fmt(row['margin'])}**（{row['margin_rate'] * 100:.1f}%）"
+                        f"{payback}"
+                    ),
+                },
+            }
+        ],
+    }
+
+
+def _finance_r7_monthly_report(period, mode):
+    """R7 仅迁全景卡身份；渠道负责人卡继续使用旧 1 号 App。"""
+    finance_token = finance_assistant_tok()
+    rows, pending = _finance_r6_monthly_rows(finance_token, period)
+    if not rows:
+        return {
+            "ok": True,
+            "app_id": FINANCE_ASSISTANT_APP_ID,
+            "period": period,
+            "mode": mode,
+            "rows": 0,
+            "note": "总表本月无数据",
+            "sent": False,
+        }
+
+    overview = build_r7_monthly_overview_card(period, rows, pending=pending)
+    card_errors = validate_r7_monthly_card(overview)
+    if card_errors:
+        raise HTTPException(500, {"card_preflight_failed": card_errors})
+
+    legacy_token = tok()
+    _dept_jt_cache.clear()
+    channel_plans = []
+    for row in rows:
+        platform = row.get("platform") or "国内电商"
+        sales = float(row.get("sales") or 0)
+        margin = float(row.get("margin") or 0)
+        plan = dict(row)
+        plan.update({
+            "platform": platform,
+            "margin_rate": (margin / sales if sales else 0),
+            "owners": _resolve_owners(legacy_token, platform),
+        })
+        channel_plans.append(plan)
+
+    result = {
+        "ok": True,
+        "app_id": FINANCE_ASSISTANT_APP_ID,
+        "period": period,
+        "mode": mode,
+        "rows": len(rows),
+        "pending_count": len(pending),
+        "overview_identity": "finance-assistant",
+        "overview_target": "finance-report-group",
+        "channel_identity": "legacy-app-1",
+        "channel_message_count": sum(len(row["owners"]) for row in channel_plans),
+        "read_only": True,
+        "sent": False,
+    }
+    if mode == "preflight":
+        return result
+
+    overview_send = _finance_r7_send_card(
+        finance_token,
+        "chat_id",
+        FINANCE_REPORT_CHAT_ID,
+        overview,
+        period,
+        "overview-finance-group",
+    )
+    if overview_send["code"] != 0:
+        raise HTTPException(502, {
+            "reason": "finance assistant overview send failed",
+            "feishu_code": overview_send["code"],
+            "feishu_msg": overview_send["msg"],
+        })
+
+    channel_results = []
+    for row in channel_plans:
+        card = _finance_r7_channel_card(period, row)
+        for owner_open_id, owner_name in row["owners"]:
+            send_result = _finance_r7_send_card(
+                legacy_token,
+                "open_id",
+                owner_open_id,
+                card,
+                period,
+                f"channel-{row['platform']}-{row['shop']}",
+            )
+            channel_results.append({
+                "platform": row["platform"],
+                "to": owner_name,
+                "code": send_result["code"],
+                "message_id": send_result["message_id"],
+            })
+
+    failures = [item for item in channel_results if item["code"] != 0]
+    if failures:
+        raise HTTPException(502, {
+            "reason": "one or more legacy channel cards failed",
+            "failure_count": len(failures),
+            "failed": failures,
+        })
+    result.update({
+        "sent": True,
+        "overview": {
+            "code": overview_send["code"],
+            "message_id": overview_send["message_id"],
+        },
+        "channel": channel_results,
+        "idempotency_scope": "feishu-server-1h",
+    })
+    return result
+
+
+@app.post("/finance-assistant/r7/monthly-report")
+async def finance_assistant_r7_monthly_report(request: Request):
+    """R7 正式单流：财务助手发全景卡，旧 1 号继续发渠道负责人卡。"""
+    _require_internal_auth(request)
+    q = request.query_params
+    period = str(q.get("period") or _last_month())
+    if not re.fullmatch(r"\d{4}-\d{2}", period):
+        raise HTTPException(400, "period must be YYYY-MM")
+    try:
+        mode = validate_r7_mode(q.get("mode"))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return _finance_r7_monthly_report(period, mode)
+
+
 @app.get("/health")
 def health(): return {"ok": True}
 
 
 @app.post("/audit")
 async def audit(request: Request):
-    if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
-        raise HTTPException(401, "unauthorized")
+    _require_internal_auth(request)
     return do_audit()
