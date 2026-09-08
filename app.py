@@ -346,6 +346,30 @@ def audit_smt(T):
 # ===== 自愈: 发现成本缺口 → 自动触发该渠道重新同步(采购补成本后下次审计自动修复) =====
 ML_SYNC_URL = os.environ.get("ML_SYNC_URL", "https://ml-sync.zeabur.app")
 ML_SYNC_TOKEN = os.environ.get("ML_SYNC_TOKEN", "")
+
+
+def _ml_operating_source(ym_dash):
+    """Resolve the immutable ML operating-close sheet; never fall back to live Base."""
+    if not ML_SYNC_TOKEN:
+        raise ValueError("美客多经营暂结状态无法读取：ML_SYNC_TOKEN 未配置")
+    response = requests.post(
+        f"{ML_SYNC_URL}/report/ml-close/status?period=month_{ym_dash}",
+        headers={"Authorization": f"Bearer {ML_SYNC_TOKEN}"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    status = response.json()
+    if (
+        status.get("ready_for_management") is not True
+        or status.get("operating_snapshot_current") is not True
+    ):
+        raise ValueError("美客多经营暂结尚未冻结，或冻结版本已与当前生产数据不一致")
+    url = ft(status.get("operating_report_sheet_url"))
+    report_hash = ft(status.get("operating_report_hash"))
+    token, typ = _parse_link(url)
+    if typ != "sheet" or not token or not report_hash:
+        raise ValueError("美客多经营暂结缺少可核验的冻结报表链接或版本哈希")
+    return {"url": url, "report_hash": report_hash}
 # 美客多 店铺名关键词 → seller_id (重同步只更新 bitable, 不发通知, 安全)
 ML_SELLER = {"巴西": "2378517428", "FUNLABDIRECTMX": "1407362838", "FUNLAB_MX": "1436420028",
              "VALMIGOZ": "3383185411", "CBT": "1502520822"}
@@ -1369,19 +1393,27 @@ def _company_mark_aggregate_loaded(T, gate):
     return _company_update_run(T, run_id, fields)
 
 
-def _company_calc_aggregate(T, url, ptype, ym_dash):
+def _company_calc_aggregate(T, url, ptype, ym_dash, include_source=False):
+    resolved_url = url
     token, typ = _parse_link(url)
     if ptype == "xb":
         if typ != "sheet" or not token:
             raise ValueError("跨境报表链接不是电子表格")
-        return _agg_xb(T, token)
-    if ptype == "ecom":
+        result = _agg_xb(T, token)
+    elif ptype == "ecom":
         if typ != "sheet" or not token:
             raise ValueError("国内电商报表链接不是电子表格")
-        return _agg_ecom(T, token)
-    if ptype == "ml":
-        return _agg_ml(T, ym_dash)
-    raise ValueError(f"未知报表类型: {ptype}")
+        result = _agg_ecom(T, token)
+    elif ptype == "ml":
+        source = _ml_operating_source(ym_dash)
+        resolved_url = source["url"]
+        token, typ = _parse_link(resolved_url)
+        if typ != "sheet" or not token:
+            raise ValueError("美客多经营暂结链接不是电子表格")
+        result = _agg_xb(T, token)
+    else:
+        raise ValueError(f"未知报表类型: {ptype}")
+    return (resolved_url, result) if include_source else result
 
 
 def _company_aggregate_run(T, run_id, *, archive=False):
@@ -1403,7 +1435,9 @@ def _company_aggregate_run(T, run_id, *, archive=False):
     if not gate.get("allow"):
         return {"ok": False, "run_id": run_id, "reason": gate.get("why"), "gate": "finance_not_approved"}
     try:
-        a = _company_calc_aggregate(T, report_link, ptype, ym_dash)
+        report_link, a = _company_calc_aggregate(
+            T, report_link, ptype, ym_dash, include_source=True
+        )
     except Exception as e:
         return {"ok": False, "run_id": run_id, "reason": str(e)[:120]}
     if not a or a["sales"] <= 0:
@@ -1587,7 +1621,9 @@ def do_aggregate():
                             "run_id": gate.get("run_id"), "removed_stale": rm})
             continue
         try:
-            a = _company_calc_aggregate(T, url, ptype, ym_dash)
+            url, a = _company_calc_aggregate(
+                T, url, ptype, ym_dash, include_source=True
+            )
         except Exception as e:
             errs.append({"shop": shop, "err": str(e)[:100]}); continue
         if not a or a["sales"] <= 0:
@@ -1941,18 +1977,11 @@ def _company_report_summary(T, fields):
         return result
     fld, cat, plat, shop, brand, ptype = cfg
     try:
-        if ptype == "xb":
-            if typ != "sheet" or not token:
-                raise ValueError("跨境报表链接不是电子表格")
-            a = _agg_xb(T, token)
-        elif ptype == "ecom":
-            if typ != "sheet" or not token:
-                raise ValueError("国内电商报表链接不是电子表格")
-            a = _agg_ecom(T, token)
-        elif ptype == "ml":
-            a = _agg_ml(T, ym_dash)
-        else:
-            raise ValueError(f"未知报表类型: {ptype}")
+        report_link, a = _company_calc_aggregate(
+            T, report_link, ptype, ym_dash, include_source=True
+        )
+        result["link"] = report_link
+        token, typ = _parse_link(report_link)
         if not a:
             result["reason"] = "报表为空或读取失败"
             return result
@@ -3772,7 +3801,8 @@ async def finance_assistant_r7_monthly_report(request: Request):
 
 
 @app.get("/health")
-def health(): return {"ok": True}
+def health():
+    return {"ok": True, "ml_operating_snapshot_bound_20260908": True}
 
 
 @app.post("/audit")
