@@ -1,0 +1,101 @@
+"""Finance App transport for the isolated ML review acceptance test.
+
+Durable records live in ML's existing persistent SQLite volume. This module
+never reads/writes wages, payments, commission data or production report rows.
+"""
+import json
+import re
+import requests
+from feishu_titles import format_title
+
+ACTION = "ml_final_test_confirm"
+SCHEMA = "ml_final_test_v1"
+FEISHU = "https://open.feishu.cn/open-apis"
+
+
+def card(revision, nonce=None):
+    complete = nonce is None
+    title = format_title("FIN", "P3", "美客多核销确认测试" + ("已处理" if complete else ""), "2026-08 · 仅测试")
+    color = "green" if complete else "blue"
+    content = ("**测试确认已保存**\n独立测试批次已进入待财务确认。真实8月报表、公司汇总、工资和提成均未改变。"
+               if complete else "**请验证确认按钮与原卡反馈**\n仅模拟运营确认，不代表梁俊辉或林纯子确认真实账单，也不会发布毛利终稿。")
+    elements = [{"tag": "column_set", "flex_mode": "none", "columns": [
+        {"tag": "column", "width": "weighted", "weight": 1, "background_style": color + "-50", "padding": "12px",
+         "elements": [{"tag": "markdown", "content": content}]}]},
+        {"tag": "markdown", "content": "无需重复点击。" if complete else "点击后应看到原卡变为已处理、按钮消失。请确认这一显示结果；如果没有更新，请告知，不必反复点击。"},
+        {"tag": "markdown", "content": "测试版本：" + revision[:12], "text_size": "notation"}]
+    if not complete:
+        elements.append({"tag": "button", "text": {"tag": "plain_text", "content": "测试确认（不放行真实报表）"},
+                         "type": "primary_filled", "width": "fill", "behaviors": [{"type": "callback", "value":
+                         {"action": ACTION, "schema": SCHEMA, "revision": revision, "nonce": nonce}}]})
+    return {"schema": "2.0", "config": {"update_multi": True, "enable_forward": False, "width_mode": "default"},
+            "header": {"title": {"tag": "plain_text", "content": title}, "template": color,
+                       "icon": {"tag": "standard_icon", "token": "approval_colorful"}},
+            "body": {"direction": "vertical", "padding": "12px 12px 20px 12px", "vertical_spacing": "12px", "elements": elements}}
+
+
+class MLReviewTransport:
+    def __init__(self, ml_url, ml_token, token_provider, frankie_union_id):
+        if ml_url.rstrip("/") != "https://ml-sync.zeabur.app" or not ml_token:
+            raise ValueError("ML review transport is not configured")
+        self.ml_url, self.ml_token = ml_url.rstrip("/"), ml_token
+        self.token_provider, self.frankie = token_provider, frankie_union_id
+
+    def ml(self, method, path, payload=None, timeout=15):
+        response = requests.request(method, self.ml_url + "/report/ml-final/test/" + path,
+                                    headers={"Authorization": "Bearer " + self.ml_token}, json=payload, timeout=timeout)
+        if response.status_code != 200:
+            raise ValueError(f"核销测试记录请求失败（HTTP {response.status_code}），未放行真实报表")
+        return response.json()
+
+    def feishu(self, method, path, payload=None):
+        response = requests.request(method, FEISHU + path,
+                                    headers={"Authorization": "Bearer " + self.token_provider()}, json=payload, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("code") != 0:
+            raise ValueError(f"财务助手请求失败（code {data.get('code')}）")
+        return data.get("data") or {}
+
+    def sample(self):
+        person = self.feishu("GET", f"/contact/v3/users/{self.frankie}?user_id_type=union_id").get("user") or {}
+        actor = person.get("open_id")
+        if not isinstance(actor, str) or not re.fullmatch(r"ou_[a-zA-Z0-9]+", actor):
+            raise ValueError("未能在财务助手身份下解析测试人")
+        prepared = self.ml("POST", "prepare", {"actor": actor})
+        if prepared.get("message_id"):
+            return {"sent": False, "duplicate": True, "message_id": prepared["message_id"]}
+        if prepared.get("delivery_uncertain") or not prepared.get("nonce"):
+            raise ValueError("上次测试卡投递结果待核查；已阻止自动重发")
+        sent = self.feishu("POST", "/im/v1/messages?receive_id_type=union_id",
+                           {"receive_id": self.frankie, "msg_type": "interactive",
+                            "uuid": "mlfinal" + prepared["revision"][:40],
+                            "content": json.dumps(card(prepared["revision"], prepared["nonce"]), ensure_ascii=False)})
+        mid = sent.get("message_id")
+        if not mid:
+            raise ValueError("测试卡没有返回消息编号，需人工核查投递结果")
+        self.ml("POST", "register", {"revision": prepared["revision"], "nonce": prepared["nonce"], "message_id": mid})
+        return {"sent": True, "recipient": "Frankie-only", "message_id": mid, "revision": prepared["revision"]}
+
+    def decide(self, ctx):
+        value = ctx["value"]
+        if value.get("action") != ACTION or value.get("schema") != SCHEMA:
+            raise ValueError("非核销测试动作")
+        return self.ml("POST", "decide", {"revision": value.get("revision"), "nonce": value.get("nonce"),
+                      "message_id": ctx["message_id"], "actor": ctx["operator_open_id"]}, timeout=(0.7, 1.2))
+
+    def flush_feedback(self):
+        pending = self.ml("GET", "feedback")
+        done = 0
+        for item in pending:
+            mid, payload = item["message_id"], item["payload"]
+            if payload.get("state") != "finance_pending" or payload.get("stage") != "ops":
+                raise ValueError("不支持的核销测试反馈状态")
+            self.feishu("PATCH", f"/im/v1/messages/{mid}", {"content": json.dumps(card(payload["revision"]), ensure_ascii=False)})
+            readback = self.feishu("GET", f"/im/v1/messages/{mid}")
+            items = readback.get("items") or []
+            if len(items) != 1 or items[0].get("message_id") != mid or "测试确认已保存" not in json.dumps(items[0], ensure_ascii=False):
+                raise ValueError("原卡结果回读未通过，保留反馈待办")
+            self.ml("POST", f"feedback/{mid}/ack", {})
+            done += 1
+        return {"patched": done, "production_enabled": False}

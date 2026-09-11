@@ -6,7 +6,9 @@
 import os, json, datetime, hashlib, time, re, threading, uuid
 from collections import defaultdict
 import requests
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi.concurrency import run_in_threadpool
+from ml_final_review import MLReviewTransport, ACTION as ML_FINAL_TEST_ACTION
 
 from finance_assistant_r5 import (
     R5CallbackRegistry,
@@ -3420,7 +3422,7 @@ async def finance_assistant_r5_sample(request: Request):
 
 
 @app.post("/finance-assistant/r5/callback")
-async def finance_assistant_r5_callback(request: Request):
+async def finance_assistant_r5_callback(request: Request, background_tasks: BackgroundTasks):
     """财务助手自己的 card.action.trigger 回调；不经过旧事件 App。"""
     body = await request.json()
     if body.get("encrypt"):
@@ -3439,6 +3441,14 @@ async def finance_assistant_r5_callback(request: Request):
 
     ctx = callback_context(body)
     value = ctx["value"]
+    if value.get("action") == ML_FINAL_TEST_ACTION:
+        try:
+            result = await run_in_threadpool(_ml_final_transport().decide, ctx)
+        except (ValueError, requests.RequestException):
+            return {"toast": {"type": "error", "content": "本次确认未完成，请联系管理员核查；真实报表未放行。"}}
+        background_tasks.add_task(_ml_final_flush_safe)
+        return {"toast": {"type": "success", "content": "测试确认已保存，正在更新原卡；真实报表未改变。"},
+                "duplicate": result.get("duplicate", False)}
     if value.get("action") != "finance_r5_ack" or value.get("schema") != "finance_assistant_r5_v1":
         return {"ignored": True, "reason": "not_finance_r5_action"}
     run_id = str(value.get("run_id") or "")
@@ -3481,6 +3491,61 @@ async def finance_assistant_r5_status(request: Request):
     if not run_id:
         raise HTTPException(400, "run_id is required")
     return _FINANCE_R5_CALLBACKS.status(run_id)
+
+
+def _ml_final_transport():
+    return MLReviewTransport(ML_SYNC_URL, ML_SYNC_TOKEN, finance_assistant_tok, FRANKIE_UNION_ID)
+
+
+def _ml_final_flush_safe():
+    try:
+        return _ml_final_transport().flush_feedback()
+    except (ValueError, requests.RequestException):
+        # Keep the durable pending row; do not acknowledge an uncertain PATCH.
+        print("[ML_FINAL] original-card feedback pending; retry required", flush=True)
+        return {"patched": False, "retry_required": True}
+
+
+_ML_FINAL_FEEDBACK_STOP = threading.Event()
+
+
+@app.on_event("startup")
+def _ml_final_start_feedback_worker():
+    if os.environ.get("ML_FINAL_TEST_FEEDBACK_WORKER") != "true":
+        return
+    _ML_FINAL_FEEDBACK_STOP.clear()
+    def work():
+        while not _ML_FINAL_FEEDBACK_STOP.wait(30):
+            _ml_final_flush_safe()
+    threading.Thread(target=work, name="ml-final-test-feedback", daemon=True).start()
+
+
+@app.on_event("shutdown")
+def _ml_final_stop_feedback_worker():
+    _ML_FINAL_FEEDBACK_STOP.set()
+
+
+@app.post("/finance-assistant/ml-final/test/sample")
+async def ml_final_test_sample(request: Request):
+    _require_internal_auth(request)
+    if not FINANCE_ASSISTANT_VERIFICATION_TOKEN or FINANCE_ASSISTANT_ENCRYPT_KEY:
+        raise HTTPException(409, "strict plain callback configuration required")
+    try:
+        return await run_in_threadpool(_ml_final_transport().sample)
+    except (ValueError, requests.RequestException) as exc:
+        raise HTTPException(502, "核销测试卡准备或投递失败，需核查后再试") from exc
+
+
+@app.get("/finance-assistant/ml-final/test/status")
+async def ml_final_test_status(request: Request):
+    _require_internal_auth(request)
+    return await run_in_threadpool(_ml_final_transport().ml, "GET", "status")
+
+
+@app.post("/finance-assistant/ml-final/test/retry-feedback")
+async def ml_final_test_retry(request: Request):
+    _require_internal_auth(request)
+    return await run_in_threadpool(_ml_final_flush_safe)
 
 
 @app.get("/finance-assistant/r6/status")
