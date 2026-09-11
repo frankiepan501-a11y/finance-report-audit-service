@@ -3525,6 +3525,15 @@ def _ml_final_stop_feedback_worker():
     _ML_FINAL_FEEDBACK_STOP.set()
 
 
+@app.post("/finance-assistant/ml-final/test/upload-sample")
+async def ml_final_upload_sample(request: Request):
+    _require_internal_auth(request)
+    try:
+        return await run_in_threadpool(_ml_final_transport().upload_sample)
+    except (ValueError, requests.RequestException) as exc:
+        raise HTTPException(409, "上传测试卡未完成，请先核对投递结果，勿重复发送") from exc
+
+
 @app.post("/finance-assistant/ml-final/test/sample")
 async def ml_final_test_sample(request: Request):
     _require_internal_auth(request)

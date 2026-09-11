@@ -86,6 +86,29 @@ class MLReviewTransport:
         return self.ml("POST", "decide", {"revision": value.get("revision"), "nonce": value.get("nonce"),
                       "message_id": ctx["message_id"], "actor": ctx["operator_open_id"]}, timeout=(0.7, 1.2))
 
+    def intake(self, path, payload=None):
+        response = requests.post(self.ml_url + "/report/ml-intake/test/" + path,
+            headers={"Authorization": "Bearer " + self.ml_token}, json=payload, timeout=15)
+        if response.status_code != 200:
+            raise ValueError("独立测试收件入口未就绪，未发送新卡")
+        return response.json()
+
+    def upload_sample(self):
+        prepared = self.intake("prepare")
+        if prepared.get("message_id"):
+            return {"sent": False, "duplicate": True, "message_id": prepared["message_id"]}
+        if not prepared.get("token"):
+            raise ValueError("上次上传卡投递结果不明；已阻止自动重发")
+        payload = upload_card(self.ml_url + "/report/ml-intake/test/upload#token=" + prepared["token"], prepared["id"])
+        sent = self.feishu("POST", "/im/v1/messages?receive_id_type=union_id", {
+            "receive_id": self.frankie, "msg_type": "interactive", "uuid": "mlupload" + prepared["id"],
+            "content": json.dumps(payload, ensure_ascii=False)})
+        mid = sent.get("message_id")
+        if not mid:
+            raise ValueError("提交卡未返回消息编号，请先核对投递结果")
+        self.intake("register", {"id": prepared["id"], "message_id": mid})
+        return {"sent": True, "recipient": "Frankie-only", "message_id": mid, "batch_id": prepared["id"], "production_enabled": False}
+
     def flush_feedback(self):
         pending = self.ml("GET", "feedback")
         done = 0
@@ -111,3 +134,19 @@ class MLReviewTransport:
             self.ml("POST", f"feedback/{mid}/ack", {})
             done += 1
         return {"patched": done, "production_enabled": False}
+
+
+def upload_card(url, batch_id):
+    if not re.fullmatch(r"https://ml-sync\.zeabur\.app/report/ml-intake/test/upload#token=[A-Za-z0-9_-]{43}", url):
+        raise ValueError("提交页面地址不合法")
+    return {"schema": "2.0", "config": {"update_multi": True, "enable_forward": False, "width_mode": "default"},
+        "header": {"title": {"tag": "plain_text", "content": format_title("FIN", "P3", "美客多账单上传测试", "2026-08 · 仅Frankie")},
+                   "template": "blue", "icon": {"tag": "standard_icon", "token": "file-form_colorful"}},
+        "body": {"direction": "vertical", "padding": "12px 12px 20px 12px", "vertical_spacing": "12px", "elements": [
+            {"tag": "column_set", "flex_mode": "none", "columns": [{"tag": "column", "width": "weighted", "weight": 1,
+                "background_style": "blue-50", "padding": "12px", "elements": [{"tag": "markdown", "content":
+                "**请测试：打开页面 → 选店铺 → 上传一份原件**\n覆盖CBT-FULL、巴西本土、MX3。系统已加重复提交和文件限制，请检查能否看到保存回执与缺件清单。"}]}]},
+            {"tag": "markdown", "content": "本次不代表梁俊辉或林纯子确认，不修改8月正式报表、工资或提成。支持XLSX/PDF/PNG/JPEG，每份≤20MB。按平台账期上传，无需自定义日期。上传成功不等于核销通过。"},
+            {"tag": "markdown", "text_size": "notation", "content": "链接24小时有效，请勿转发。完成后回复测试结果或截图；本卡可再次打开查看清单。测试批次：" + batch_id[:12]},
+            {"tag": "button", "type": "primary_filled", "width": "fill", "text": {"tag": "plain_text", "content": "打开上传页面（仅测试）"},
+             "behaviors": [{"type": "open_url", "default_url": url}]}]}}

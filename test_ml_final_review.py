@@ -1,10 +1,37 @@
 import json
 import unittest
 from unittest.mock import Mock, patch
-from ml_final_review import MLReviewTransport, card, ACTION, SCHEMA
+from ml_final_review import MLReviewTransport, card, upload_card, ACTION, SCHEMA
 
 
 class MLFinalTransportTests(unittest.TestCase):
+    def test_upload_card_is_url_only_and_test_scoped(self):
+        result = upload_card("https://ml-sync.zeabur.app/report/ml-intake/test/upload#token=" + "a"*43, "b"*32)
+        self.assertEqual(result["schema"], "2.0")
+        self.assertFalse(result["config"]["enable_forward"])
+        self.assertEqual(result["body"]["elements"][-1]["behaviors"][0]["type"], "open_url")
+        self.assertNotIn('"callback"', json.dumps(result))
+        with self.assertRaises(ValueError):
+            upload_card("https://example.com/", "b"*32)
+
+    def test_upload_card_uses_frankie_identity_and_never_exposes_link_in_receipt(self):
+        self.transport.intake = Mock(side_effect=[{"token":"a"*43,"id":"b"*32}, {"ok":True}])
+        self.transport.feishu.return_value = {"message_id":"om_upload"}
+        result = self.transport.upload_sample()
+        self.assertEqual(result["message_id"], "om_upload")
+        self.assertNotIn("a"*43, json.dumps(result))
+        self.assertEqual(self.transport.feishu.call_args.args[2]["receive_id"], "on_test")
+        self.assertEqual(self.transport.intake.call_args.args, ("register", {"id":"b"*32,"message_id":"om_upload"}))
+
+    def test_upload_card_does_not_repeat_registered_or_uncertain_send(self):
+        self.transport.intake = Mock(return_value={"message_id":"om_upload"})
+        self.assertTrue(self.transport.upload_sample()["duplicate"])
+        self.transport.feishu.assert_not_called()
+        self.transport.intake.return_value = {"delivery_uncertain":True}
+        with self.assertRaises(ValueError):
+            self.transport.upload_sample()
+        self.transport.feishu.assert_not_called()
+
     def setUp(self):
         self.transport = MLReviewTransport("https://ml-sync.zeabur.app", "offline-test", lambda: "offline-test", "on_test")
         self.transport.ml = Mock()
