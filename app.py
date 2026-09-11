@@ -3511,7 +3511,7 @@ _ML_FINAL_FEEDBACK_STOP = threading.Event()
 
 @app.on_event("startup")
 def _ml_final_start_feedback_worker():
-    if os.environ.get("ML_FINAL_TEST_FEEDBACK_WORKER") != "true":
+    if os.environ.get("ML_FINAL_TEST_FEEDBACK_WORKER", "true") != "true":
         return
     _ML_FINAL_FEEDBACK_STOP.clear()
     def work():

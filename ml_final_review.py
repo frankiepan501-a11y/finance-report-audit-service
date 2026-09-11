@@ -16,6 +16,8 @@ FEISHU = "https://open.feishu.cn/open-apis"
 def card(revision, nonce=None):
     complete = nonce is None
     title = format_title("FIN", "P3", "美客多核销确认测试" + ("已处理" if complete else ""), "2026-08 · 仅测试")
+    if complete:
+        title += " · " + revision[:12]
     color = "green" if complete else "blue"
     content = ("**测试确认已保存**\n独立测试批次已进入待财务确认。真实8月报表、公司汇总、工资和提成均未改变。"
                if complete else "**请验证确认按钮与原卡反馈**\n仅模拟运营确认，不代表梁俊辉或林纯子确认真实账单，也不会发布毛利终稿。")
@@ -91,10 +93,20 @@ class MLReviewTransport:
             mid, payload = item["message_id"], item["payload"]
             if payload.get("state") != "finance_pending" or payload.get("stage") != "ops":
                 raise ValueError("不支持的核销测试反馈状态")
-            self.feishu("PATCH", f"/im/v1/messages/{mid}", {"content": json.dumps(card(payload["revision"]), ensure_ascii=False)})
+            result_card = card(payload["revision"])
+            self.feishu("PATCH", f"/im/v1/messages/{mid}", {"content": json.dumps(result_card, ensure_ascii=False)})
             readback = self.feishu("GET", f"/im/v1/messages/{mid}")
             items = readback.get("items") or []
-            if len(items) != 1 or items[0].get("message_id") != mid or "测试确认已保存" not in json.dumps(items[0], ensure_ascii=False):
+            # Card 2.0 GET may return a compatibility stub, not the rendered body.
+            # Verify the exact version-bound result title after a successful PATCH.
+            message = items[0] if len(items) == 1 else {}
+            try:
+                content = json.loads(message.get("body", {}).get("content", ""))
+            except (ValueError, TypeError):
+                content = {}
+            if (message.get("message_id") != mid or message.get("msg_type") != "interactive"
+                    or message.get("updated") is not True or not isinstance(content, dict)
+                    or content.get("title") != result_card["header"]["title"]["content"]):
                 raise ValueError("原卡结果回读未通过，保留反馈待办")
             self.ml("POST", f"feedback/{mid}/ack", {})
             done += 1

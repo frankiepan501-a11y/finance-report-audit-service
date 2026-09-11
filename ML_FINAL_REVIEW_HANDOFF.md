@@ -8,11 +8,17 @@
 
 回调沿用 `/finance-assistant/r5/callback` 严格Verification Token校验，仅新增 `ml_final_test_confirm` / `ml_final_test_v1` 分支。业务记录在ML服务 `/data/ml_sync.db` 独立测试表中保存，真实月结状态与报表不动。测试只走运营确认一步，不能代表完整双人流程已验收。
 
-`ML_FINAL_TEST_FEEDBACK_WORKER=true` 时，后台每30秒重试未完成原卡反馈；PATCH成功且GET回读含结果文本后才完成待办。后台失败只记录安全提示，不输出令牌。重复PATCH不新增消息。
+独立测试反馈后台默认开启，每30秒重试未完成原卡反馈；设置 `ML_FINAL_TEST_FEEDBACK_WORKER=false` 可关闭。只消费ML固定测试批次，不处理正式财务确认或发送新卡。后台失败保留待办，不输出令牌；重复PATCH只更新原消息。
+
+## 2026-09-11 原卡查询兼容修复
+
+用户真实点击已使测试批次进入finance_pending，客户端原卡绿色已处理。故障是Card2查询正文只返回升级客户端提示，旧代码搜索正文导致待办无法清零。现在PATCH成功后核验原消息编号、interactive类型、updated=true，以及精确匹配含12位版本号的已处理标题，全部通过才ACK。错误版本、非结果标题、错误消息和失败查询均保留待办。此协议核验不声称能够检查完整正文；正文渲染依据用户提供的真实截图。
+
+改动：ml_final_review.py、app.py、test_ml_final_review.py。没有改环境变量、工资、付款、经营暂结源表或正式索引。回滚可恢复3871c34（旧版会保留反馈待办），保留SQLite证据。
 
 ## 检查
 
-`run_tests_offline.py` 阻断requests/httpx外部访问。30项测试通过；新增测试覆盖卡片结构、投递不明不重发、命名空间、回调鉴权、消息编号保留、PATCH/回读失败不清待办。此数字不包含真实用户点击。
+`run_tests_offline.py` 阻断requests/httpx外部访问。33项测试通过；包括真实兼容摘要回归（修复前失败）、错误版本/消息/更新标记拒绝、空队列不发卡、默认后台与关闭开关。此数字不包含真实用户点击。
 
 ## 回滚
 

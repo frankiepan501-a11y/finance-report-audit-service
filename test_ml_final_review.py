@@ -52,10 +52,32 @@ class MLFinalTransportTests(unittest.TestCase):
 
     def test_patch_success_acknowledges_only_original_card(self):
         self.transport.ml.side_effect = [[{"message_id": "om_test", "payload": {"revision": "a"*64, "state": "finance_pending", "stage": "ops"}}], {"ok": True}]
-        self.transport.feishu.side_effect = [{}, {"items": [{"message_id": "om_test", "body": {"content": "测试确认已保存"}}]}]
+        self.transport.feishu.side_effect = [{}, {"items": [self.result_message()]}]
         self.assertEqual(self.transport.flush_feedback()["patched"], 1)
         self.assertEqual(self.transport.feishu.call_args_list[0].args[:2], ("PATCH", "/im/v1/messages/om_test"))
         self.assertEqual(self.transport.ml.call_args.args[1], "feedback/om_test/ack")
+
+    def result_message(self):
+        return {"message_id": "om_test", "msg_type": "interactive", "updated": True,
+                "body": {"content": json.dumps({"title": card("a"*64)["header"]["title"]["content"],
+                    "elements": [[{"tag": "text", "text": "请升级至最新版本客户端，以查看内容"}]]}, ensure_ascii=False)}}
+
+    def test_wrong_message_version_or_update_never_acknowledged(self):
+        for change in ({"message_id": "om_other"}, {"updated": False}, {"msg_type": "text"},
+                       {"body": {"content": json.dumps({"title": card("c"*64)["header"]["title"]["content"]})}},
+                       {"body": {"content": "测试确认已保存"}}, {"body": {"content": "[]"}}):
+            with self.subTest(change=change):
+                self.transport.ml.reset_mock()
+                self.transport.ml.return_value = [{"message_id": "om_test", "payload": {"revision": "a"*64, "state": "finance_pending", "stage": "ops"}}]
+                self.transport.feishu.side_effect = [{}, {"items": [{**self.result_message(), **change}]}]
+                with self.assertRaises(ValueError):
+                    self.transport.flush_feedback()
+                self.assertEqual(self.transport.ml.call_count, 1)
+
+    def test_empty_queue_never_patches_or_sends(self):
+        self.transport.ml.return_value = []
+        self.assertEqual(self.transport.flush_feedback()["patched"], 0)
+        self.transport.feishu.assert_not_called()
 
     def test_unrelated_callback_rejected_without_request(self):
         with self.assertRaises(ValueError):
@@ -71,6 +93,16 @@ class MLFinalTransportTests(unittest.TestCase):
 
 
 class MLFinalCallbackTests(unittest.TestCase):
+    def test_isolated_feedback_worker_enabled_by_default_and_can_be_disabled(self):
+        import app as service
+        with patch.dict(service.os.environ, {}, clear=True), patch.object(service.threading, "Thread") as thread:
+            service._ml_final_start_feedback_worker()
+            thread.return_value.start.assert_called_once()
+            self.assertEqual(thread.call_args.kwargs["name"], "ml-final-test-feedback")
+        with patch.dict(service.os.environ, {"ML_FINAL_TEST_FEEDBACK_WORKER": "false"}), patch.object(service.threading, "Thread") as thread:
+            service._ml_final_start_feedback_worker()
+            thread.assert_not_called()
+
     def test_strict_callback_auth_and_original_message_preserved(self):
         import app as service
         from fastapi.testclient import TestClient
