@@ -34,7 +34,7 @@ class WalmartFinanceHandoffTests(unittest.TestCase):
     def test_department_only_no_fixed_frankie_or_former_staff(self):
         users = {"a": {"union_id": "u-a"}, "b": {"union_id": "u-b"},
                  "dup": {"union_id": "u-a"}, "former": {"status": {"is_resigned": True}}}
-        with patch.object(app, "_dept_members", return_value={k:k for k in users}), \
+        with patch.object(app, "_company_walmart_department_members", return_value={k:k for k in users}), \
              patch.object(app, "_contact_user", side_effect=lambda t, oid: users[oid]):
             got = app._company_walmart_finance_recipients("T")
         self.assertEqual(got[0]["id"], "oc_6b2da626d80eb6284bbe9dcf895030b9")
@@ -44,7 +44,7 @@ class WalmartFinanceHandoffTests(unittest.TestCase):
     def test_missing_identity_and_empty_department_stop_sending(self):
         for members, user in [({}, {}), ({"a":"甲"}, {}), ({"a":"甲"}, {"name":"甲"})]:
             with self.subTest(members=members, user=user), \
-                 patch.object(app, "_dept_members", return_value=members), \
+                 patch.object(app, "_company_walmart_department_members", return_value=members), \
                  patch.object(app, "_contact_user", return_value=user), \
                  self.assertRaises(app.HTTPException):
                 app._company_walmart_finance_recipients("T")
@@ -127,6 +127,44 @@ class WalmartFinanceHandoffTests(unittest.TestCase):
         self.assertEqual(self.guarded(f,c),"")
         self.assertIn("财务部",self.guarded(f,c,"outsider"))
 
+    def test_unregistered_production_card_cannot_approve(self):
+        f, c = self.guarded_fields()
+        f["payload_json"] = run()["fields"]["payload_json"]
+        self.assertTrue(self.guarded(f,c))
+
+    def test_department_later_page_failure_never_sends_partial_list(self):
+        responses = [{"code":0,"data":{"items":[{"open_id":"a","name":"甲"}],
+                                     "has_more":True,"page_token":"next"}}, {"code":99991663}]
+        with patch.object(app.requests,"get",side_effect=[Mock(json=lambda r=r:r) for r in responses]), self.assertRaises(app.HTTPException):
+            app._company_walmart_department_members("T")
+
+    def test_failed_result_patch_is_saved_and_repeat_only_repairs_display(self):
+        f,c = self.guarded_fields()
+        f["报表状态"] = "已归档"
+        c["value"].update({"action":"company_profit_finance_approve","run_id":f["run_id"]})
+        rr = {"record_id":"rec_test","fields":f}
+        saved=[]
+        def save(t,r,d):
+            saved.append(copy.deepcopy(d))
+            p=app._company_run_payload(f);p["walmart_finance_delivery"]=copy.deepcopy(d)
+            f["payload_json"]=json.dumps(p)
+        card={"elements":[],"header":{"title":{"tag":"plain_text","content":"已处理"}}}
+        with patch.object(app,"tok",return_value="T"), patch.object(app,"event_tok",return_value="ET"), \
+             patch.object(app,"_company_save_walmart_delivery",side_effect=save), \
+             patch.object(app,"_patch_message_card",side_effect=[{"code":230020},{"code":0}]), \
+             patch.object(app,"_bt_find",return_value=rr), \
+             patch.object(app,"_contact_user",return_value={"union_id":"u-a"}), \
+             patch.object(app,"_company_walmart_finance_recipients",return_value=TARGETS), \
+             patch.object(app,"_company_mark_finance_approved") as approve, \
+             patch.object(app,"_company_aggregate_run") as aggregate:
+            app._company_walmart_sync_result("T",rr,card)
+            self.assertEqual(saved[-1]["result_sync"][0]["code"],230020)
+            result=app._handle_company_callback(c)
+            self.assertTrue(result["duplicate"])
+            self.assertEqual(saved[-1]["result_sync"][0]["code"],0)
+            self.assertEqual(saved[-1]["result_card"],card)
+            approve.assert_not_called();aggregate.assert_not_called()
+
     def test_callback_blocks_old_version_removed_card_and_second_decision(self):
         for kind in ["version","removed","second"]:
             f,c=self.guarded_fields()
@@ -139,8 +177,8 @@ class WalmartFinanceHandoffTests(unittest.TestCase):
         f,c=self.guarded_fields();p=app._company_run_payload(f)
         p["walmart_finance_delivery"]["targets"].update({"person":{"active":True,"message_id":"dm"},"old":{"active":False,"message_id":"old"}})
         f["payload_json"]=json.dumps(p)
-        with patch.object(app,"event_tok",return_value="ET"),patch.object(app,"_patch_message_card",return_value={"code":0}) as update:
-            app._company_walmart_sync_result(f,{"elements":[]})
+        with patch.object(app,"_company_save_walmart_delivery"), patch.object(app,"event_tok",return_value="ET"),patch.object(app,"_patch_message_card",return_value={"code":0}) as update:
+            app._company_walmart_sync_result("T", {"record_id":"rec_test","fields":f},{"elements":[]})
         self.assertEqual([x.args[1] for x in update.call_args_list],["m","dm"])
 
     def test_reuse_amazon_layout_with_precise_walmart_labels(self):

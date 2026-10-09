@@ -2352,9 +2352,31 @@ def _company_send_workflow_card(T, run, card_name, card, recipient_mode):
     return sent
 
 
+def _company_walmart_department_members(T):
+    members, page, seen = {}, None, set()
+    while True:
+        params = {"department_id": FIN_DEPT, "page_size": 50, "user_id_type": "open_id",
+                  "department_id_type": "open_department_id"}
+        if page:
+            params["page_token"] = page
+        response = requests.get(f"{FEISHU}/contact/v3/users", params=params,
+                                headers={"Authorization": f"Bearer {T}"}, timeout=20).json()
+        if response.get("code") != 0:
+            raise HTTPException(502, "财务部成员查询失败，停止发送，避免遗漏接收人。")
+        data = response.get("data") or {}
+        for user in data.get("items", []):
+            members[user["open_id"]] = user.get("name")
+        if not data.get("has_more"):
+            return members
+        page = data.get("page_token")
+        if not page or page in seen:
+            raise HTTPException(502, "财务部成员分页异常，停止发送。")
+        seen.add(page)
+
+
 def _company_walmart_finance_recipients(T):
     """The finance group plus current department employees; no extra person."""
-    members = _dept_members(T, FIN_DEPT)
+    members = _company_walmart_department_members(T)
     if not members:
         raise HTTPException(409, "财务部成员查询为空，停止发送，避免遗漏接收人。")
     recipients = [{"name": "财务部工作交流群", "type": "chat_id", "id": FINANCE_REPORT_CHAT_ID}]
@@ -2413,6 +2435,8 @@ def _company_send_walmart_finance(T, ET, run, card):
     targets = delivery.setdefault("targets", {})
     review_key = _company_walmart_review_key(fields)
     delivery["review_key"] = review_key
+    delivery.pop("result_card", None)
+    delivery.pop("result_sync", None)
     card = json.loads(json.dumps(card))
     for element in card.get("elements", []):
         for button in element.get("actions", []):
@@ -2902,32 +2926,41 @@ def _patch_or_fallback(ctx, card):
 def _company_walmart_callback_guard(T, fields, ctx):
     delivery = _company_run_payload(fields).get("walmart_finance_delivery")
     if not delivery:
-        return ""
+        return "" if _company_is_smoke_run(fields, ft(fields.get("run_id"))) else "本卡尚未登记为当前审核卡，请使用财务部当前审核卡。"
     active = [r for r in delivery.get("targets", {}).values() if r.get("active")]
     if not any(r.get("message_id") == ctx.get("message_id") for r in active):
         return "本卡已退出审核范围，请使用财务部当前审核卡。"
     if ctx["value"].get("walmart_review_key") != _company_walmart_review_key(fields):
         return "报表版本已更新，请刷新当前审核卡后操作。"
-    if ft(fields.get("报表状态")) != "待财务终审":
-        return "这份报表已有人处理，无需重复审批；请查看当前处理结果。"
     operator = _contact_user(event_tok(), ctx.get("operator_open_id"))
     uid = ft(operator.get("union_id"))
-    if _company_is_smoke_run(fields, ft(fields.get("run_id"))) and uid == FRANKIE_UNION_ID:
-        return ""
-    allowed = {r["id"] for r in _company_walmart_finance_recipients(T) if r["type"] == "union_id"}
-    if not uid or uid not in allowed:
-        return "仅财务部当前员工可以处理这份终审。"
+    if not (_company_is_smoke_run(fields, ft(fields.get("run_id"))) and uid == FRANKIE_UNION_ID):
+        allowed = {r["id"] for r in _company_walmart_finance_recipients(T) if r["type"] == "union_id"}
+        if not uid or uid not in allowed:
+            return "仅财务部当前员工可以处理这份终审。"
+    if ft(fields.get("报表状态")) != "待财务终审":
+        return "already_processed"
     return ""
 
 
-def _company_walmart_sync_result(fields, card):
-    delivery = _company_run_payload(fields).get("walmart_finance_delivery") or {}
+def _company_walmart_sync_result(T, run, card):
+    delivery = _company_run_payload(run.get("fields", {})).get("walmart_finance_delivery") or {}
+    if not delivery:
+        return []
+    delivery["result_card"] = card
+    # Persist the decided display before PATCH so a retry never repeats approval.
+    _company_save_walmart_delivery(T, run, delivery)
     results = []
     ET = event_tok()
     for target in delivery.get("targets", {}).values():
         if target.get("active") and target.get("message_id"):
-            res = _patch_message_card(ET, target["message_id"], card)
+            try:
+                res = _patch_message_card(ET, target["message_id"], card)
+            except requests.RequestException:
+                res = {"code": -1}
             results.append({"message_id": target["message_id"], "code": res.get("code")})
+    delivery["result_sync"] = results
+    _company_save_walmart_delivery(T, run, delivery)
     return results
 
 
@@ -2943,11 +2976,19 @@ def _handle_company_callback(body):
     gap_id = str(value.get("gap_id") or "")
     idempotency_key = str(value.get("idempotency_key") or _payload_hash(value))
     card_type = str(value.get("card_type") or "")
-    current = (_bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or {}).get("fields", {})
+    current_record = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or {}
+    current = current_record.get("fields", {})
     walmart_finance = (action in ("company_profit_finance_approve", "company_profit_finance_return")
                        and _company_run_payload(current).get("platform_id") == "walmart")
     if walmart_finance:
         reason = _company_walmart_callback_guard(T, current, ctx)
+        if reason == "already_processed":
+            delivery = _company_run_payload(current).get("walmart_finance_delivery") or {}
+            result_card = delivery.get("result_card") or _company_processed_card(
+                "毛利审核已有处理结果", "本次仅更新卡片显示，无需重复审批。",
+                details={"当前状态": ft(current.get("报表状态"))})
+            return {"ok": True, "duplicate": True, "run_id": run_id,
+                    "finance_card_sync": _company_walmart_sync_result(T, current_record, result_card)}
         if reason:
             # Do not overwrite a valid group card on unauthorized/stale clicks.
             return {"ok": False, "ignored": True, "message": reason, "run_id": run_id}
@@ -3052,8 +3093,8 @@ def _handle_company_callback(body):
     }
     card = _company_processed_card("✅ 毛利卡片已处理" if ok else "⚠️ 毛利卡片未通过",
                                    result_message, ok=ok, details=result_details)
-    patched = _patch_or_fallback(ctx, card)
-    synced = _company_walmart_sync_result(after_run, card) if walmart_finance else []
+    patched = {} if walmart_finance else _patch_or_fallback(ctx, card)
+    synced = _company_walmart_sync_result(T, {**current_record, "fields": after_run}, card) if walmart_finance else []
     return {"ok": ok, "action": action, "run_id": run_id, "patch": patched,
             "finance_card_sync": synced}
 
