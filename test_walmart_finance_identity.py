@@ -79,6 +79,23 @@ class WalmartFinanceIdentityTests(unittest.TestCase):
             app._company_walmart_sync_result('FIN',rr,{'elements':[]})
         self.assertEqual(patches.call_args.args[:2],('FIN','new'))
 
+    def test_blocked_callback_retry_does_not_fall_back_to_old_app(self):
+        rr=run()
+        body={'value':{'action':'company_profit_finance_approve','run_id':rr['fields']['run_id']}}
+        with patch.object(app,'finance_assistant_tok',return_value='FIN'), \
+             patch.object(app,'_bt_find',return_value=rr), \
+             patch.object(app,'_company_walmart_callback_guard',return_value=''), \
+             patch.object(app,'_company_audit_exists',return_value=True), \
+             patch.object(app,'_company_walmart_sync_result',return_value=[]) as sync, \
+             patch.object(app,'_patch_or_fallback',side_effect=AssertionError('Legacy fallback called')):
+            result=app._handle_company_callback(body,delivery_identity='finance_assistant')
+        self.assertTrue(result['duplicate']);sync.assert_called_once()
+
+    def test_send_rechecks_human_decision_and_does_not_restore_pending(self):
+        original=run();fresh=copy.deepcopy(original);fresh['fields']['报表状态']='已归档'
+        with patch.object(app,'_finance_walmart_get',return_value={'record':fresh}), self.assertRaises(app.HTTPException):
+            app._company_send_walmart_finance('FIN','FIN',original,CARD)
+
 
 if __name__ == '__main__':
     unittest.main()

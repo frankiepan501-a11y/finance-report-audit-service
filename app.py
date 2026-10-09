@@ -2950,9 +2950,13 @@ def _patch_or_fallback(ctx, card):
 
 
 def _company_walmart_callback_guard(T, fields, ctx, delivery_identity="legacy_event"):
+    if delivery_identity != "finance_assistant":
+        return "本卡机器人归属已变更，请使用财务助手当前卡片。"
     delivery = _company_run_payload(fields).get("walmart_finance_delivery")
     if not delivery:
-        return "" if _company_is_smoke_run(fields, ft(fields.get("run_id"))) else "本卡尚未登记为当前审核卡，请使用财务部当前审核卡。"
+        return "本卡尚未登记为当前审核卡，请使用财务部当前审核卡。"
+    if delivery.get("app_id") == FINANCE_ASSISTANT_APP_ID and delivery_identity != "finance_assistant":
+        return "本卡机器人归属已变更，请使用财务助手当前卡片。"
     active = [r for r in delivery.get("targets", {}).values() if r.get("active")]
     target = next((r for r in active if r.get("message_id") == ctx.get("message_id")), None)
     if not target:
@@ -3039,6 +3043,9 @@ def _handle_company_callback_locked(body, *, delivery_identity):
                                                 "月份": _company_period_label(current_run.get("期间")),
                                                 "当前状态": ft(current_run.get("报表状态")),
                                                 "缺口状态": ft(current_gap.get("处理结果"))})
+        if walmart_finance:
+            return {"duplicate": True, "finance_card_sync": _company_walmart_sync_result(
+                T, {**current_record, "fields": current_run}, card)}
         return {"duplicate": True, "patch": _patch_or_fallback(ctx, card)}
 
     before = {"run": (_bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or {}).get("fields", {}),

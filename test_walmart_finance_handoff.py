@@ -113,11 +113,11 @@ class WalmartFinanceHandoffTests(unittest.TestCase):
         with patch.object(app,"event_tok",return_value="ET"), \
              patch.object(app,"_contact_user",return_value={"union_id":uid}), \
              patch.object(app,"_company_walmart_finance_recipients",return_value=TARGETS):
-            return app._company_walmart_callback_guard("T",fields,ctx)
+            return app._company_walmart_callback_guard("T",fields,ctx,"finance_assistant")
 
     def guarded_fields(self):
         f=run()["fields"];p=app._company_run_payload(f)
-        p["walmart_finance_delivery"]={"targets":{"group":{"active":True,"message_id":"m"}}}
+        p["walmart_finance_delivery"]={"app_id":app.FINANCE_ASSISTANT_APP_ID,"targets":{"group":{"active":True,"message_id":"m","app_id":app.FINANCE_ASSISTANT_APP_ID}}}
         f["payload_json"]=json.dumps(p)
         ctx={"message_id":"m","operator_open_id":"actor","value":{"walmart_review_key":app._company_walmart_review_key(f)}}
         return f,ctx
@@ -149,7 +149,7 @@ class WalmartFinanceHandoffTests(unittest.TestCase):
             p=app._company_run_payload(f);p["walmart_finance_delivery"]=copy.deepcopy(d)
             f["payload_json"]=json.dumps(p)
         card={"elements":[],"header":{"title":{"tag":"plain_text","content":"已处理"}}}
-        with patch.object(app,"tok",return_value="T"), patch.object(app,"event_tok",return_value="ET"), \
+        with patch.object(app,"finance_assistant_tok",return_value="T"), patch.object(app,"tok",return_value="T"), patch.object(app,"event_tok",return_value="ET"), \
              patch.object(app,"_company_save_walmart_delivery",side_effect=save), \
              patch.object(app,"_patch_message_card",side_effect=[{"code":230020},{"code":0}]), \
              patch.object(app,"_bt_find",return_value=rr), \
@@ -159,7 +159,7 @@ class WalmartFinanceHandoffTests(unittest.TestCase):
              patch.object(app,"_company_aggregate_run") as aggregate:
             app._company_walmart_sync_result("T",rr,card)
             self.assertEqual(saved[-1]["result_sync"][0]["code"],230020)
-            result=app._handle_company_callback(c)
+            result=app._handle_company_callback(c,delivery_identity="finance_assistant")
             self.assertTrue(result["duplicate"])
             self.assertEqual(saved[-1]["result_sync"][0]["code"],0)
             self.assertEqual(saved[-1]["result_card"],card)
@@ -177,7 +177,7 @@ class WalmartFinanceHandoffTests(unittest.TestCase):
         f,c=self.guarded_fields();p=app._company_run_payload(f)
         p["walmart_finance_delivery"]["targets"].update({"person":{"active":True,"message_id":"dm"},"old":{"active":False,"message_id":"old"}})
         f["payload_json"]=json.dumps(p)
-        with patch.object(app,"_company_save_walmart_delivery"), patch.object(app,"event_tok",return_value="ET"),patch.object(app,"_patch_message_card",return_value={"code":0}) as update:
+        with patch.object(app,"finance_assistant_tok",return_value="FT"), patch.object(app,"_company_save_walmart_delivery"), patch.object(app,"event_tok",return_value="ET"),patch.object(app,"_patch_message_card",return_value={"code":0}) as update:
             app._company_walmart_sync_result("T", {"record_id":"rec_test","fields":f},{"elements":[]})
         self.assertEqual([x.args[1] for x in update.call_args_list],["m","dm"])
 
