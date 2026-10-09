@@ -105,6 +105,7 @@ _COMPANY_ASYNC_LOCK = threading.Lock()
 _FINANCE_R5_CALLBACKS = R5CallbackRegistry()
 _FINANCE_R6_SEND_RECEIPTS = {}
 _FINANCE_R6_SEND_LOCK = threading.Lock()
+_WALMART_FINANCE_LOCK = threading.RLock()
 
 COMPANY_PLATFORM_REGISTRY = {
     "amazon": {"name": "Amazon", "platform": "亚马逊", "site": "亚马逊全站", "data_mode": "api", "data_status": "取数完成", "report_status": "待财务终审", "blocker_type": "", "blocker": "财务部", "maturity": "confirmed", "generator_type": "n8n_webhook", "workflow_id": "CyapOmKK0hyIJoXY", "generator_method": "GET", "generator_path": "trigger-amazon-profit"},
@@ -2336,11 +2337,12 @@ def _company_audit_run_cycle(T, run, *, source_action="run_month"):
 
 
 def _company_send_workflow_card(T, run, card_name, card, recipient_mode):
-    ET = event_tok()
     run_id = ft((run or {}).get("fields", {}).get("run_id"))
-    if (card_name == "finance" and recipient_mode != "frankie"
+    if (card_name == "finance"
             and _company_run_payload(run.get("fields", {})).get("platform_id") == "walmart"):
-        return _company_send_walmart_finance(T, ET, run, card)
+        FT = finance_assistant_tok()
+        return _company_send_walmart_finance(FT, FT, run, card, recipient_mode=recipient_mode)
+    ET = event_tok()
     recipients = _company_finance_card_recipients(T, "frankie" if card_name == "p0_gap" else recipient_mode)
     sent = []
     for recipient in recipients:
@@ -2425,16 +2427,30 @@ def _company_save_walmart_delivery(T, run, delivery):
         raise HTTPException(502, "终审发送记录保存失败，停止继续发送；请先查已发回执。")
 
 
-def _company_send_walmart_finance(T, ET, run, card):
+def _company_send_walmart_finance(T, ET, run, card, *, recipient_mode="finance_gray"):
+    with _WALMART_FINANCE_LOCK:
+        fresh = _finance_walmart_get(T, f"/bitable/v1/apps/{IDX_APP}/tables/{COMPANY_RUN_TBL}/records/{run['record_id']}")["record"]
+        if _company_walmart_review_key(fresh.get("fields", {})) != _company_walmart_review_key(run.get("fields", {})):
+            raise HTTPException(409, "发送前报表版本变化，停止发送，请重新核验。")
+        return _company_send_walmart_finance_locked(T, ET, fresh, card, recipient_mode=recipient_mode)
+
+
+def _company_send_walmart_finance_locked(T, ET, run, card, *, recipient_mode):
     fields = run.get("fields", {})
     run_id = ft(fields.get("run_id"))
     if ft(fields.get("报表状态")) != "待财务终审":
         raise HTTPException(409, "当前不是待财务终审状态，不发送新审核卡。")
-    recipients = _company_walmart_finance_recipients(T)
+    if recipient_mode == "frankie":
+        if not _company_is_smoke_run(fields, run_id):
+            raise HTTPException(409, "财务助手测试仅允许隔离测试记录，真实终审请发财务部。")
+        recipients = [{"name": "Frankie 测试", "type": "union_id", "id": FRANKIE_UNION_ID}]
+    else:
+        recipients = _company_walmart_finance_recipients(T)
     delivery = _company_run_payload(fields).get("walmart_finance_delivery") or {"targets": {}}
     targets = delivery.setdefault("targets", {})
     review_key = _company_walmart_review_key(fields)
     delivery["review_key"] = review_key
+    delivery["app_id"] = FINANCE_ASSISTANT_APP_ID
     delivery.pop("result_card", None)
     delivery.pop("result_sync", None)
     card = json.loads(json.dumps(card))
@@ -2442,14 +2458,23 @@ def _company_send_walmart_finance(T, ET, run, card):
         for button in element.get("actions", []):
             if (button.get("value") or {}).get("action", "").startswith("company_profit_finance_"):
                 button["value"]["walmart_review_key"] = review_key
+                button["value"]["delivery_identity"] = "finance_assistant"
     desired = {r["type"] + ":" + r["id"] for r in recipients}
-    for key, old in targets.items():
-        if key not in desired and old.get("active", True) and old.get("message_id"):
-            result = _patch_message_card(ET, old["message_id"], _company_processed_card(
-                "审核接收范围已更新", "终审已交财务部群及财务部员工，本卡不再处理。"))
+    for key, old in list(targets.items()):
+        old_app = old.get("app_id", EVENT_APP_ID)
+        if (key not in desired or old_app != FINANCE_ASSISTANT_APP_ID) and old.get("active", True) and old.get("message_id"):
+            if old_app not in (EVENT_APP_ID, FINANCE_ASSISTANT_APP_ID):
+                raise HTTPException(409, "旧卡应用归属未知，停止迁移。")
+            old_token = ET if old_app == FINANCE_ASSISTANT_APP_ID else event_tok()
+            result = _patch_message_card(old_token, old["message_id"], _company_processed_card(
+                "终审卡已由财务助手接管", "请使用财务助手发送的当前终审卡。本卡已关闭，不再处理审核。"))
             if result.get("code") != 0:
                 raise HTTPException(502, "旧终审卡关闭失败，请核验后继续。")
             old["active"] = False
+            old["app_id"] = old_app
+            targets["retired:" + old["message_id"]] = old
+            del targets[key]
+            _company_save_walmart_delivery(T, run, delivery)
     _company_save_walmart_delivery(T, run, delivery)
     sent = []
     for recipient in recipients:
@@ -2470,7 +2495,8 @@ def _company_send_walmart_finance(T, ET, run, card):
             operation = "sent"
         if res.get("code") != 0 or not mid:
             raise HTTPException(502, f"财务终审卡发送/更新失败：{recipient['name']}，请查已登记回执，勿整批重发。")
-        targets[key] = {**recipient, "message_id": mid, "active": True, "review_key": review_key}
+        targets[key] = {**recipient, "message_id": mid, "active": True, "review_key": review_key,
+                        "app_id": FINANCE_ASSISTANT_APP_ID}
         _company_save_walmart_delivery(T, run, delivery)
         sent.append({"to": recipient["name"], "code": 0, "message_id": mid, "operation": operation})
     return sent
@@ -2923,16 +2949,20 @@ def _patch_or_fallback(ctx, card):
     return {"patched_original_card": False}
 
 
-def _company_walmart_callback_guard(T, fields, ctx):
+def _company_walmart_callback_guard(T, fields, ctx, delivery_identity="legacy_event"):
     delivery = _company_run_payload(fields).get("walmart_finance_delivery")
     if not delivery:
         return "" if _company_is_smoke_run(fields, ft(fields.get("run_id"))) else "本卡尚未登记为当前审核卡，请使用财务部当前审核卡。"
     active = [r for r in delivery.get("targets", {}).values() if r.get("active")]
-    if not any(r.get("message_id") == ctx.get("message_id") for r in active):
+    target = next((r for r in active if r.get("message_id") == ctx.get("message_id")), None)
+    if not target:
         return "本卡已退出审核范围，请使用财务部当前审核卡。"
+    expected_app = FINANCE_ASSISTANT_APP_ID if delivery_identity == "finance_assistant" else EVENT_APP_ID
+    if target.get("app_id", EVENT_APP_ID) != expected_app:
+        return "本卡机器人归属已变更，请使用财务助手当前卡片。"
     if ctx["value"].get("walmart_review_key") != _company_walmart_review_key(fields):
         return "报表版本已更新，请刷新当前审核卡后操作。"
-    operator = _contact_user(event_tok(), ctx.get("operator_open_id"))
+    operator = _contact_user(T if delivery_identity == "finance_assistant" else event_tok(), ctx.get("operator_open_id"))
     uid = ft(operator.get("union_id"))
     if not (_company_is_smoke_run(fields, ft(fields.get("run_id"))) and uid == FRANKIE_UNION_ID):
         allowed = {r["id"] for r in _company_walmart_finance_recipients(T) if r["type"] == "union_id"}
@@ -2951,7 +2981,7 @@ def _company_walmart_sync_result(T, run, card):
     # Persist the decided display before PATCH so a retry never repeats approval.
     _company_save_walmart_delivery(T, run, delivery)
     results = []
-    ET = event_tok()
+    ET = finance_assistant_tok() if delivery.get("app_id") == FINANCE_ASSISTANT_APP_ID else event_tok()
     for target in delivery.get("targets", {}).values():
         if target.get("active") and target.get("message_id"):
             try:
@@ -2964,8 +2994,13 @@ def _company_walmart_sync_result(T, run, card):
     return results
 
 
-def _handle_company_callback(body):
-    T = tok()
+def _handle_company_callback(body, *, delivery_identity="legacy_event"):
+    with _WALMART_FINANCE_LOCK:
+        return _handle_company_callback_locked(body, delivery_identity=delivery_identity)
+
+
+def _handle_company_callback_locked(body, *, delivery_identity):
+    T = finance_assistant_tok() if delivery_identity == "finance_assistant" else tok()
     ctx = _company_callback_context(body)
     value = ctx["value"]
     action = str(value.get("action") or "")
@@ -2980,8 +3015,10 @@ def _handle_company_callback(body):
     current = current_record.get("fields", {})
     walmart_finance = (action in ("company_profit_finance_approve", "company_profit_finance_return")
                        and _company_run_payload(current).get("platform_id") == "walmart")
+    if delivery_identity == "finance_assistant" and not walmart_finance:
+        return {"ok": False, "ignored": True, "message": "本入口只承接沃尔玛财务终审。"}
     if walmart_finance:
-        reason = _company_walmart_callback_guard(T, current, ctx)
+        reason = _company_walmart_callback_guard(T, current, ctx, delivery_identity)
         if reason == "already_processed":
             delivery = _company_run_payload(current).get("walmart_finance_delivery") or {}
             result_card = delivery.get("result_card") or _company_processed_card(
@@ -3607,6 +3644,82 @@ async def finance_assistant_r5_sample(request: Request):
     }
 
 
+def _finance_walmart_callback_safe(body):
+    try:
+        return _handle_company_callback(body, delivery_identity="finance_assistant")
+    except Exception as exc:
+        # No raw payload/token in logs; a scoped retry reads the recorded business state.
+        ctx = _company_callback_context(body)
+        print(json.dumps({"event": "walmart_finance_callback_failed", "run_id": ctx["value"].get("run_id"),
+                          "message_id": ctx["message_id"], "error_type": type(exc).__name__}), flush=True)
+        raise
+
+
+def _finance_walmart_get(T, path):
+    result = requests.get(FEISHU + path, headers={"Authorization": f"Bearer {T}"}, timeout=20).json()
+    if result.get("code") != 0:
+        raise HTTPException(502, {"resource": path, "feishu_code": result.get("code"),
+                                  "message": "财务助手访问失败，不回退旧机器人。"})
+    return result.get("data") or {}
+
+
+@app.post("/finance-assistant/walmart/review")
+async def finance_walmart_review(request: Request):
+    """Scoped preflight/send/status; defaults to read-only and never regenerates the report."""
+    _require_internal_auth(request)
+    body = await request.json()
+    mode = body.get("mode", "preflight")
+    if mode not in ("preflight", "send", "status", "smoke_replay"):
+        raise HTTPException(400, "invalid mode")
+    run_id = str(body.get("run_id") or "")
+    if not FINANCE_ASSISTANT_VERIFICATION_TOKEN or FINANCE_ASSISTANT_ENCRYPT_KEY:
+        raise HTTPException(503, "财务助手严格回调配置不完整，停止发送。")
+    T = finance_assistant_tok()
+    # Check codes before shared readers, whose historical error handling is less strict.
+    for table in (COMPANY_RUN_TBL, COMPANY_GAP_TBL, COMPANY_AUDIT_TBL):
+        _finance_walmart_get(T, f"/bitable/v1/apps/{IDX_APP}/tables/{table}/records?page_size=1")
+    run = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id)
+    if not run or _company_run_payload(run.get("fields", {})).get("platform_id") != "walmart":
+        raise HTTPException(404, "Walmart run not found")
+    fields = run["fields"]
+    delivery = _company_run_payload(fields).get("walmart_finance_delivery") or {}
+    if mode == "status":
+        messages = []
+        for target in delivery.get("targets", {}).values():
+            if target.get("active") and target.get("app_id") == FINANCE_ASSISTANT_APP_ID:
+                messages.append(_finance_walmart_get(T, "/im/v1/messages/" + target["message_id"]))
+        return {"app_id": FINANCE_ASSISTANT_APP_ID, "run": run, "messages": messages}
+    smoke = _company_is_smoke_run(fields, run_id)
+    if mode == "smoke_replay":
+        targets = [v for v in delivery.get("targets", {}).values() if v.get("active")]
+        if not smoke or len(targets) != 1 or targets[0].get("id") != FRANKIE_UNION_ID or targets[0].get("app_id") != FINANCE_ASSISTANT_APP_ID:
+            raise HTTPException(409, "Only a registered Frankie-only isolated smoke card may be replayed")
+        target = targets[0]
+        message = _finance_walmart_get(T, "/im/v1/messages/" + target["message_id"])["items"][0]
+        members = _finance_walmart_get(T, "/im/v1/chats/" + message["chat_id"] + "/members?member_id_type=open_id")["items"]
+        operator = next((m["member_id"] for m in members if _contact_user(T, m["member_id"]).get("union_id") == FRANKIE_UNION_ID), None)
+        if not operator:
+            raise HTTPException(409, "Unable to verify test operator in Finance App namespace")
+        value = {"action": "company_profit_finance_approve", "run_id": run_id,
+                 "walmart_review_key": _company_walmart_review_key(fields), "delivery_identity": "finance_assistant"}
+        return _finance_walmart_callback_safe({"value": value, "operator_open_id": operator,
+                                               "message_id": target["message_id"], "chat_id": message["chat_id"]})
+    recipients = _company_walmart_finance_recipients(T)
+    group = _finance_walmart_get(T, "/im/v1/chats/" + FINANCE_REPORT_CHAT_ID)
+    summary = _company_report_summary(T, fields)
+    if not summary.get("ok"):
+        raise HTTPException(409, {"report_access": summary, "message": "财务助手无法读取完整报表，停止发送。"})
+    reason = _company_finance_block_reason(T, run_id, summary)
+    if reason or ft(fields.get("报表状态")) != "待财务终审" or ft(fields.get("P0数量")) != "0":
+        raise HTTPException(409, reason or "Run is not ready for finance review")
+    card = _company_finance_card(T, run, test_mode=smoke)
+    if mode == "preflight":
+        return {"ok": True, "app_id": FINANCE_ASSISTANT_APP_ID, "group": group.get("name"),
+                "recipients": recipients, "card": card, "rows": summary.get("rows"), "run": run, "sent": False}
+    sent = _company_send_walmart_finance(T, T, run, card, recipient_mode="frankie" if smoke else "finance_gray")
+    return {"ok": True, "app_id": FINANCE_ASSISTANT_APP_ID, "run_id": run_id, "sent": sent}
+
+
 @app.post("/finance-assistant/r5/callback")
 async def finance_assistant_r5_callback(request: Request, background_tasks: BackgroundTasks):
     """财务助手自己的 card.action.trigger 回调；不经过旧事件 App。"""
@@ -3627,6 +3740,11 @@ async def finance_assistant_r5_callback(request: Request, background_tasks: Back
 
     ctx = callback_context(body)
     value = ctx["value"]
+    if (value.get("delivery_identity") == "finance_assistant"
+            and value.get("action") in ("company_profit_finance_approve", "company_profit_finance_return")):
+        # Acknowledge promptly; the existing financial operation may exceed Feishu's callback timeout.
+        background_tasks.add_task(_finance_walmart_callback_safe, body)
+        return {"toast": {"type": "info", "content": "已收到操作，财务助手正在核验；处理结果会更新到卡片。"}}
     if value.get("action") == ML_FINAL_TEST_ACTION:
         try:
             result = await run_in_threadpool(_ml_final_transport().decide, ctx)
@@ -4063,7 +4181,8 @@ async def finance_assistant_r7_monthly_report(request: Request):
 @app.get("/health")
 def health():
     return {"ok": True, "ml_operating_snapshot_bound_20260908": True,
-            "walmart_finance_group_department_20261009": True}
+            "walmart_finance_group_department_20261009": True,
+            "walmart_finance_assistant_20261009": True}
 
 
 @app.post("/audit")

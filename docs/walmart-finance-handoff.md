@@ -1,5 +1,15 @@
 # Walmart finance handoff — 2026-10-09
 
+## Identity correction confirmed by user
+
+The previous Event App choice was an implementation error: the user had already assigned Finance work to 财务助手 (`cli_aa1d52694f61dbc1`). For Walmart final review, new cards, contact lookup, ledger operations, callbacks and result PATCH use that App. Old Event App credentials are used only to close its already-issued cards. Other channels remain an explicit migration backlog, not a claim of completed Finance-domain rollout.
+
+Use `/finance-assistant/walmart/review` with the existing internal authorization. Default `mode=preflight` verifies the Finance App's run/gap/audit access, current department members, group and bound sheet without sending. `mode=send` sends the actual ready run to Finance group+members; a clearly marked smoke run goes only to Frankie. `status` reads Finance App messages. `smoke_replay` accepts only a registered isolated Frankie card and never a production run. The existing strictly authenticated `/finance-assistant/r5/callback` handles the new review actions and acknowledges before completing the business operation. A shared service lock serializes send/decision work. Before sends, read state/version again; never reset a human decision.
+
+Delivery receipts now record `app_id`. All prior Event App cards are retired under their actual App, then new cards are issued under the Finance App with stable UUIDs. Old callback routes cannot act on new App cards. If Finance access/configuration fails, fail explicitly; never fall back to the old App for new sends.
+
+The sections below retain the initial recipient/layout change; the Event App identity statement is superseded by this correction.
+
 ## Scope and contract
 
 User requested Walmart final-review cards to the finance group `oc_6b2da626d80eb6284bbe9dcf895030b9` plus current Finance department employees. Do not add Frankie separately, hardcode employee names, migrate Apps, or change other platforms' routes. The existing Event App sends, receives callbacks, and updates cards. Financial approval remains a human decision.

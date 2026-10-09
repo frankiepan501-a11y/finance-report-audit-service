@@ -50,15 +50,15 @@ class WalmartFinanceHandoffTests(unittest.TestCase):
                 app._company_walmart_finance_recipients("T")
 
     def test_only_walmart_production_uses_new_route(self):
-        with patch.object(app, "event_tok", return_value="ET"), \
+        with patch.object(app, "finance_assistant_tok", return_value="FT"), patch.object(app, "event_tok", return_value="ET"), \
              patch.object(app, "_company_send_walmart_finance", return_value=["new"]) as new, \
              patch.object(app, "_company_finance_card_recipients", return_value=[]) as old:
             self.assertEqual(app._company_send_workflow_card("T",run(),"finance",CARD,"finance_gray"),["new"])
             app._company_send_workflow_card("T",run(),"finance",CARD,"frankie")
             app._company_send_workflow_card("T",run("amazon"),"finance",CARD,"finance_gray")
             app._company_send_workflow_card("T",run(),"p0_gap",CARD,"finance_gray")
-            self.assertEqual(new.call_count,1)
-            self.assertEqual([c.args[1] for c in old.call_args_list],["frankie","finance_gray","frankie"])
+            self.assertEqual(new.call_count,2)
+            self.assertEqual([c.args[1] for c in old.call_args_list],["finance_gray","frankie"])
 
     def deliver(self, r, existing=None):
         if existing:
@@ -71,7 +71,7 @@ class WalmartFinanceHandoffTests(unittest.TestCase):
             rr["fields"]["payload_json"] = json.dumps(p)
         mids = iter(["new-group", "new-a", "new-b"])
         response = lambda *a, **k: Mock(json=lambda:{"code":0,"data":{"message_id":next(mids)}})
-        with patch.object(app,"_company_walmart_finance_recipients",return_value=TARGETS), \
+        with patch.object(app,"_finance_walmart_get",side_effect=lambda *a:{"record":r}), patch.object(app,"event_tok",return_value="LEGACY"), patch.object(app,"_company_walmart_finance_recipients",return_value=TARGETS), \
              patch.object(app,"_company_save_walmart_delivery",side_effect=save), \
              patch.object(app,"_patch_message_card",return_value={"code":0}) as patches, \
              patch.object(app.requests,"post",side_effect=response) as sends:
@@ -92,15 +92,15 @@ class WalmartFinanceHandoffTests(unittest.TestCase):
             self.assertEqual(value["walmart_review_key"],app._company_walmart_review_key(r["fields"]))
 
     def test_current_month_reuses_employee_cards_closes_frankie_adds_group(self):
-        old={"union_id:u-a":{"message_id":"old-a","active":True},
-             "union_id:u-b":{"message_id":"old-b","active":True},
+        old={"union_id:u-a":{"message_id":"old-a","active":True,"app_id":app.FINANCE_ASSISTANT_APP_ID},
+             "union_id:u-b":{"message_id":"old-b","active":True,"app_id":app.FINANCE_ASSISTANT_APP_ID},
              "union_id:frankie":{"message_id":"old-f","active":True}}
         first,_,_,patches,count,r=self.deliver(run(),old)
         self.assertEqual(count,1)
         self.assertEqual([x["message_id"] for x in first],["new-group","old-a","old-b"])
         self.assertEqual(patches[0][0][1],"old-f")
         self.assertNotIn("company_profit_finance_approve",json.dumps(patches[0][0][2]))
-        self.assertFalse(app._company_run_payload(r["fields"])["walmart_finance_delivery"]["targets"]["union_id:frankie"]["active"])
+        self.assertFalse(app._company_run_payload(r["fields"])["walmart_finance_delivery"]["targets"]["retired:old-f"]["active"])
 
     def test_failed_receipt_write_is_not_reported_as_success(self):
         rr=run()
