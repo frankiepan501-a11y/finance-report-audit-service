@@ -28,7 +28,7 @@ class WalmartFinanceIdentityTests(unittest.TestCase):
         saves=[]
         def save(t,r,d):saves.append(copy.deepcopy(d))
         seq=iter(['new-group','new-a','new-b'])
-        with patch.object(app,'_finance_walmart_get',return_value={'record':rr}), patch.object(app,'_company_walmart_finance_recipients',return_value=TARGETS), \
+        with patch.object(app,'_finance_walmart_record',return_value=rr), patch.object(app,'_company_walmart_finance_recipients',return_value=TARGETS), \
              patch.object(app,'event_tok',return_value='OLD'), \
              patch.object(app,'_patch_message_card',return_value={'code':0}) as patches, \
              patch.object(app,'_company_save_walmart_delivery',side_effect=save), \
@@ -93,8 +93,17 @@ class WalmartFinanceIdentityTests(unittest.TestCase):
 
     def test_send_rechecks_human_decision_and_does_not_restore_pending(self):
         original=run();fresh=copy.deepcopy(original);fresh['fields']['报表状态']='已归档'
-        with patch.object(app,'_finance_walmart_get',return_value={'record':fresh}), self.assertRaises(app.HTTPException):
+        with patch.object(app,'_finance_walmart_record',return_value=fresh), self.assertRaises(app.HTTPException):
             app._company_send_walmart_finance('FIN','FIN',original,CARD)
+
+    def test_scoped_record_reader_uses_approved_list_permission_and_checks_pages(self):
+        rr=run();rr['record_id']='wanted'
+        pages=[{'items':[], 'has_more':True, 'page_token':'next'}, {'items':[rr], 'has_more':False}]
+        with patch.object(app,'_finance_walmart_get',side_effect=pages) as get:
+            self.assertEqual(app._finance_walmart_record('FIN','wanted'),rr)
+        self.assertTrue(all(c.args[0]=='FIN' and '/records?' in c.args[1] for c in get.call_args_list))
+        with patch.object(app,'_finance_walmart_get',return_value={'items':[], 'has_more':True}), self.assertRaises(app.HTTPException):
+            app._finance_walmart_record('FIN','wanted')
 
 
 if __name__ == '__main__':

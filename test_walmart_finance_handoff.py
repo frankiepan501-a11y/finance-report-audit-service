@@ -71,7 +71,7 @@ class WalmartFinanceHandoffTests(unittest.TestCase):
             rr["fields"]["payload_json"] = json.dumps(p)
         mids = iter(["new-group", "new-a", "new-b"])
         response = lambda *a, **k: Mock(json=lambda:{"code":0,"data":{"message_id":next(mids)}})
-        with patch.object(app,"_finance_walmart_get",side_effect=lambda *a:{"record":r}), patch.object(app,"event_tok",return_value="LEGACY"), patch.object(app,"_company_walmart_finance_recipients",return_value=TARGETS), \
+        with patch.object(app,"_finance_walmart_record",side_effect=lambda *a:r), patch.object(app,"event_tok",return_value="LEGACY"), patch.object(app,"_company_walmart_finance_recipients",return_value=TARGETS), \
              patch.object(app,"_company_save_walmart_delivery",side_effect=save), \
              patch.object(app,"_patch_message_card",return_value={"code":0}) as patches, \
              patch.object(app.requests,"post",side_effect=response) as sends:
@@ -104,7 +104,7 @@ class WalmartFinanceHandoffTests(unittest.TestCase):
 
     def test_failed_receipt_write_is_not_reported_as_success(self):
         rr=run()
-        with patch.object(app.requests,"get",return_value=Mock(json=lambda:{"code":0,"data":{"record":rr}})), \
+        with patch.object(app,"_finance_walmart_record",return_value=rr), \
              patch.object(app.requests,"put",return_value=Mock(json=lambda:{"code":1254036})), \
              self.assertRaises(app.HTTPException):
             app._company_save_walmart_delivery("T",rr,{"targets":{}})

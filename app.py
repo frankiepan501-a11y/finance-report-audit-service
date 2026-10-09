@@ -2410,10 +2410,7 @@ def _company_save_walmart_delivery(T, run, delivery):
     # Read afresh to preserve unrelated evidence and generator metadata.
     url = f"{FEISHU}/bitable/v1/apps/{IDX_APP}/tables/{COMPANY_RUN_TBL}/records/{run['record_id']}"
     headers = {"Authorization": f"Bearer {T}"}
-    current = requests.get(url, headers=headers, timeout=20).json()
-    if current.get("code") != 0:
-        raise HTTPException(502, "终审发送记录读取失败，停止继续发送。")
-    fields = current["data"]["record"]["fields"]
+    fields = _finance_walmart_record(T, run['record_id'])["fields"]
     payload = _company_run_payload(fields)
     payload["walmart_finance_delivery"] = delivery
     ids = [x for x in ft(fields.get("原卡message_ids")).split(",") if x]
@@ -2429,7 +2426,7 @@ def _company_save_walmart_delivery(T, run, delivery):
 
 def _company_send_walmart_finance(T, ET, run, card, *, recipient_mode="finance_gray"):
     with _WALMART_FINANCE_LOCK:
-        fresh = _finance_walmart_get(T, f"/bitable/v1/apps/{IDX_APP}/tables/{COMPANY_RUN_TBL}/records/{run['record_id']}")["record"]
+        fresh = _finance_walmart_record(T, run['record_id'])
         if _company_walmart_review_key(fresh.get("fields", {})) != _company_walmart_review_key(run.get("fields", {})):
             raise HTTPException(409, "发送前报表版本变化，停止发送，请重新核验。")
         return _company_send_walmart_finance_locked(T, ET, fresh, card, recipient_mode=recipient_mode)
@@ -3670,6 +3667,26 @@ def _finance_walmart_get(T, path):
     return result.get("data") or {}
 
 
+def _finance_walmart_record(T, record_id):
+    # The approved base:record:retrieve permission supports listing records.
+    # Single-record GET requests a different scope; keep the existing scope.
+    page, seen = None, set()
+    while True:
+        path = f"/bitable/v1/apps/{IDX_APP}/tables/{COMPANY_RUN_TBL}/records?page_size=500"
+        if page:
+            path += "&page_token=" + requests.utils.quote(page, safe="")
+        data = _finance_walmart_get(T, path)
+        for record in data.get("items", []):
+            if record.get("record_id") == record_id:
+                return record
+        if not data.get("has_more"):
+            raise HTTPException(404, "审核记录不存在，停止处理。")
+        page = data.get("page_token")
+        if not page or page in seen:
+            raise HTTPException(502, "审核记录分页异常，停止处理。")
+        seen.add(page)
+
+
 @app.post("/finance-assistant/walmart/review")
 async def finance_walmart_review(request: Request):
     """Scoped preflight/send/status; defaults to read-only and never regenerates the report."""
@@ -4188,7 +4205,8 @@ def health():
     return {"ok": True, "ml_operating_snapshot_bound_20260908": True,
             "walmart_finance_group_department_20261009": True,
             "walmart_finance_assistant_20261009": True,
-            "walmart_finance_minimal_scopes_20261009": True}
+            "walmart_finance_minimal_scopes_20261009": True,
+            "walmart_finance_record_listing_20261009": True}
 
 
 @app.post("/audit")
