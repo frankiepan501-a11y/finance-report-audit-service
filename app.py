@@ -3702,17 +3702,15 @@ async def finance_walmart_review(request: Request):
         if not smoke or len(targets) != 1 or targets[0].get("id") != FRANKIE_UNION_ID or targets[0].get("app_id") != FINANCE_ASSISTANT_APP_ID:
             raise HTTPException(409, "Only a registered Frankie-only isolated smoke card may be replayed")
         target = targets[0]
-        message = _finance_walmart_get(T, "/im/v1/messages/" + target["message_id"])["items"][0]
-        members = _finance_walmart_get(T, "/im/v1/chats/" + message["chat_id"] + "/members?member_id_type=open_id")["items"]
-        operator = next((m["member_id"] for m in members if _contact_user(T, m["member_id"]).get("union_id") == FRANKIE_UNION_ID), None)
-        if not operator:
+        user = _finance_walmart_get(T, "/contact/v3/users/" + FRANKIE_UNION_ID + "?user_id_type=union_id").get("user") or {}
+        operator = user.get("open_id")
+        if not operator or user.get("union_id") != FRANKIE_UNION_ID:
             raise HTTPException(409, "Unable to verify test operator in Finance App namespace")
         value = {"action": "company_profit_finance_approve", "run_id": run_id,
                  "walmart_review_key": _company_walmart_review_key(fields), "delivery_identity": "finance_assistant"}
         return _finance_walmart_callback_safe({"value": value, "operator_open_id": operator,
-                                               "message_id": target["message_id"], "chat_id": message["chat_id"]})
+                                               "message_id": target["message_id"]})
     recipients = _company_walmart_finance_recipients(T)
-    group = _finance_walmart_get(T, "/im/v1/chats/" + FINANCE_REPORT_CHAT_ID)
     summary = _company_report_summary(T, fields)
     if not summary.get("ok"):
         raise HTTPException(409, {"report_access": summary, "message": "财务助手无法读取完整报表，停止发送。"})
@@ -3721,7 +3719,7 @@ async def finance_walmart_review(request: Request):
         raise HTTPException(409, reason or "Run is not ready for finance review")
     card = _company_finance_card(T, run, test_mode=smoke)
     if mode == "preflight":
-        return {"ok": True, "app_id": FINANCE_ASSISTANT_APP_ID, "group": group.get("name"),
+        return {"ok": True, "app_id": FINANCE_ASSISTANT_APP_ID, "group": FINANCE_REPORT_CHAT_ID,
                 "recipients": recipients, "card": card, "rows": summary.get("rows"), "run": run, "sent": False}
     sent = _company_send_walmart_finance(T, T, run, card, recipient_mode="frankie" if smoke else "finance_gray")
     return {"ok": True, "app_id": FINANCE_ASSISTANT_APP_ID, "run_id": run_id, "sent": sent}
@@ -4189,7 +4187,8 @@ async def finance_assistant_r7_monthly_report(request: Request):
 def health():
     return {"ok": True, "ml_operating_snapshot_bound_20260908": True,
             "walmart_finance_group_department_20261009": True,
-            "walmart_finance_assistant_20261009": True}
+            "walmart_finance_assistant_20261009": True,
+            "walmart_finance_minimal_scopes_20261009": True}
 
 
 @app.post("/audit")
