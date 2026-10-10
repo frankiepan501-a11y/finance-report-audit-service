@@ -21,7 +21,9 @@ class WalmartFinalIndexTests(unittest.TestCase):
                       '亚马逊毛利报表': {'link': 'amazon-report'}}}
 
     def test_archive_publishes_approved_walmart_url_with_final_status(self):
-        with patch.object(app, '_idx_find_record', return_value=self.index), \
+        updated = copy.deepcopy(self.index)
+        updated['fields']['沃尔玛毛利报表'] = {'link': self.url}
+        with patch.object(app, '_idx_find_record', side_effect=[self.index, updated]), \
              patch.object(app, '_company_ensure_index_finalize_fields', return_value={'ok': True}), \
              patch.object(app.requests, 'put', return_value=Mock(json=lambda: {'code': 0})) as put:
             result = app._company_mark_index_finalized('FIN', self.fields, 1791596613384)
@@ -29,6 +31,18 @@ class WalmartFinalIndexTests(unittest.TestCase):
         changed = put.call_args.kwargs['json']['fields']
         self.assertEqual(changed['沃尔玛毛利报表']['link'], self.url)
         self.assertNotIn('亚马逊毛利报表', changed)
+
+    def test_normal_month_without_repair_specific_review_url_is_supported(self):
+        payload = app._company_run_payload(self.fields)
+        payload.pop('review_url')
+        self.fields['payload_json'] = json.dumps(payload)
+        self.test_archive_publishes_approved_walmart_url_with_final_status()
+
+    def test_normal_archive_checks_actual_published_link(self):
+        with patch.object(app, '_idx_find_record', return_value=self.index), \
+             patch.object(app, '_company_ensure_index_finalize_fields', return_value={'ok': True}), \
+             patch.object(app.requests, 'put', return_value=Mock(json=lambda: {'code': 0})):
+            self.assertFalse(app._company_mark_index_finalized('FIN', self.fields, 1791596613384)['ok'])
 
     def approval(self):
         return {'record_id': 'audit-human', 'fields': {
@@ -41,17 +55,21 @@ class WalmartFinalIndexTests(unittest.TestCase):
         rows = [self.approval()]
         updated = copy.deepcopy(self.index)
         updated['fields']['沃尔玛毛利报表'] = {'link': self.url}
+        prepared = {'record_id': 'repair-row', 'fields': {'before_json': json.dumps(self.index), 'result': 'prepared'}}
+        completed = copy.deepcopy(prepared)
+        completed['fields']['result'] = 'ok'
         with patch.object(app, '_bitable_all', return_value=rows), \
              patch.object(app, '_idx_find_record', side_effect=[self.index, updated, updated]), \
-             patch.object(app, '_company_write_system_audit') as audit, \
+             patch.object(app, '_bt_find', side_effect=[None, prepared, completed, completed]), \
+             patch.object(app, '_company_write_audit') as audit, \
              patch.object(app.requests, 'put', return_value=Mock(json=lambda: {'code': 0})) as put:
             result = app._finance_walmart_repair_index('FIN', self.fields)
             repeat = app._finance_walmart_repair_index('FIN', self.fields)
         self.assertTrue(result['ok'])
         self.assertTrue(repeat['unchanged'])
-        put.assert_called_once()
-        self.assertEqual(set(put.call_args.kwargs['json']['fields']), {'沃尔玛毛利报表'})
-        self.assertEqual(put.call_args.kwargs['headers']['Authorization'], 'Bearer FIN')
+        self.assertEqual(put.call_count, 2)
+        self.assertEqual(set(put.call_args_list[0].kwargs['json']['fields']), {'沃尔玛毛利报表'})
+        self.assertEqual(put.call_args_list[0].kwargs['headers']['Authorization'], 'Bearer FIN')
         audit.assert_called_once()
 
     def test_repair_rejects_unapproved_changed_or_unrecorded_review(self):
@@ -68,9 +86,35 @@ class WalmartFinalIndexTests(unittest.TestCase):
     def test_repair_does_not_report_success_on_failed_write(self):
         with patch.object(app, '_bitable_all', return_value=[self.approval()]), \
              patch.object(app, '_idx_find_record', return_value=self.index), \
+             patch.object(app, '_bt_find', return_value={'record_id': 'repair-row', 'fields': {'before_json': '{}', 'result': 'prepared'}}), \
              patch.object(app.requests, 'put', return_value=Mock(json=lambda: {'code': 99991672})), \
              self.assertRaises(app.HTTPException):
             app._finance_walmart_repair_index('FIN', self.fields)
+
+    def test_failed_backup_blocks_index_write(self):
+        with patch.object(app, '_bitable_all', return_value=[self.approval()]), \
+             patch.object(app, '_idx_find_record', return_value=self.index), \
+             patch.object(app, '_bt_find', return_value=None), \
+             patch.object(app, '_company_write_audit'), \
+             patch.object(app.requests, 'put') as put, self.assertRaises(app.HTTPException):
+            app._finance_walmart_repair_index('FIN', self.fields)
+        put.assert_not_called()
+
+    def test_repeat_finishes_prepared_audit_without_rewriting_index(self):
+        updated = copy.deepcopy(self.index)
+        updated['fields']['沃尔玛毛利报表'] = {'link': self.url}
+        prepared = {'record_id': 'repair-row', 'fields': {'before_json': json.dumps(self.index), 'result': 'prepared'}}
+        completed = copy.deepcopy(prepared)
+        completed['fields']['result'] = 'ok'
+        with patch.object(app, '_bitable_all', return_value=[self.approval()]), \
+             patch.object(app, '_idx_find_record', return_value=updated), \
+             patch.object(app, '_bt_find', side_effect=[prepared, completed]), \
+             patch.object(app.requests, 'put', return_value=Mock(json=lambda: {'code': 0})) as put:
+            result = app._finance_walmart_repair_index('FIN', self.fields)
+        self.assertTrue(result['ok'])
+        self.assertTrue(result['unchanged'])
+        put.assert_called_once()
+        self.assertIn(app.COMPANY_AUDIT_TBL, put.call_args.args[0])
 
     def test_scoped_endpoint_uses_finance_identity_and_current_record(self):
         run = {'record_id': 'run-row', 'fields': self.fields}

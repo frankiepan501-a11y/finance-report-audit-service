@@ -1588,6 +1588,11 @@ def _company_mark_index_finalized(T, run_fields, archive_ms):
     if resp.get("code") != 0:
         return {"ok": False, "reason": resp.get("msg") or "index update failed",
                 "code": resp.get("code"), "platform_id": platform_id}
+    if platform_id == "walmart":
+        actual = _idx_find_record(T, ym_slash)
+        actual_link = ((actual or {}).get("fields", {}).get("沃尔玛毛利报表") or {}).get("link")
+        if actual_link != fields["沃尔玛毛利报表"]["link"]:
+            return {"ok": False, "reason": "沃尔玛正式索引链接回读不一致", "platform_id": platform_id}
     return {"ok": True, "record_id": rec["record_id"], "platform_id": platform_id,
             "version_field": version_field, "version": COMPANY_REPORT_FINAL_VERSION,
             "status_field": COMPANY_INDEX_PLATFORM_FINAL_STATUS_FIELD,
@@ -3674,7 +3679,7 @@ def _company_walmart_final_link(fields):
     url = ft(fields.get("报表链接"))
     if (payload.get("platform_id") != "walmart"
             or ft(fields.get("报表状态")) not in COMPANY_AGG_APPROVED_STATUSES
-            or not url or url != payload.get("review_url")):
+            or not url or (payload.get("review_url") and url != payload["review_url"])):
         raise HTTPException(409, "未找到财务已确认且版本一致的沃尔玛报表，停止更新索引。")
     period = ft(payload.get("report_period")) or ft(fields.get("期间"))
     return {"link": url, "text": f"沃尔玛毛利表-{period}-财务终稿"}
@@ -3705,22 +3710,37 @@ def _finance_walmart_repair_index(T, fields):
     before = _idx_find_record(T, period.replace("-", "/"))
     if not before:
         raise HTTPException(404, "对应月份索引不存在。")
-    if (before.get("fields", {}).get("沃尔玛毛利报表") or {}).get("link") == link["link"]:
+    unchanged = (before.get("fields", {}).get("沃尔玛毛利报表") or {}).get("link") == link["link"]
+    audit_key = _payload_hash({"repair_index": run_id, "approval": approval["record_id"], "url": link["link"]})[:32]
+    audit = _bt_find(T, COMPANY_AUDIT_TBL, "idempotency_key", audit_key)
+    if unchanged and (not audit or ft(audit.get("fields", {}).get("result")) == "ok"):
         return {"ok": True, "unchanged": True, "record_id": before["record_id"]}
-    response = requests.put(
-        f"{FEISHU}/bitable/v1/apps/{IDX_APP}/tables/{IDX_TBL}/records/{before['record_id']}",
-        headers={"Authorization": f"Bearer {T}", "Content-Type": "application/json"},
-        json={"fields": {"沃尔玛毛利报表": link}}, timeout=20).json()
-    if response.get("code") != 0:
-        raise HTTPException(502, {"feishu_code": response.get("code"), "message": "正式索引链接写入失败。"})
+    if not audit:
+        _company_write_audit(T, audit_key, "walmart_final_index_link_repaired", "system", run_id,
+                             "index", before["record_id"],
+                             {"沃尔玛毛利报表": before["fields"].get("沃尔玛毛利报表")},
+                             {"沃尔玛毛利报表": link}, {"approval_record_id": approval["record_id"]}, "prepared")
+        audit = _bt_find(T, COMPANY_AUDIT_TBL, "idempotency_key", audit_key)
+    # The legacy audit writer does not check API codes. Read before changing the index.
+    if not audit or not ft(audit.get("fields", {}).get("before_json")):
+        raise HTTPException(502, "旧链接留档失败，未修改正式索引。")
+    H = {"Authorization": f"Bearer {T}", "Content-Type": "application/json"}
+    if not unchanged:
+        response = requests.put(
+            f"{FEISHU}/bitable/v1/apps/{IDX_APP}/tables/{IDX_TBL}/records/{before['record_id']}",
+            headers=H, json={"fields": {"沃尔玛毛利报表": link}}, timeout=20).json()
+        if response.get("code") != 0:
+            raise HTTPException(502, {"feishu_code": response.get("code"), "message": "正式索引链接写入失败。"})
     after = _idx_find_record(T, period.replace("-", "/"))
     if not after or (after.get("fields", {}).get("沃尔玛毛利报表") or {}).get("link") != link["link"]:
         raise HTTPException(502, "正式索引链接回读不一致，请先核查，不要重跑财务审批。")
-    _company_write_system_audit(T, "walmart_final_index_link_repaired", run_id,
-                                {"沃尔玛毛利报表": before["fields"].get("沃尔玛毛利报表")},
-                                {"沃尔玛毛利报表": link}, {"approval_record_id": approval["record_id"]},
-                                "ok", target_type="index", target_id=before["record_id"])
-    return {"ok": True, "record_id": before["record_id"], "link": link,
+    response = requests.put(
+        f"{FEISHU}/bitable/v1/apps/{IDX_APP}/tables/{COMPANY_AUDIT_TBL}/records/{audit['record_id']}",
+        headers=H, json={"fields": {"result": "ok"}}, timeout=20).json()
+    confirmed = _bt_find(T, COMPANY_AUDIT_TBL, "idempotency_key", audit_key)
+    if response.get("code") != 0 or ft((confirmed or {}).get("fields", {}).get("result")) != "ok":
+        raise HTTPException(502, "索引已补齐，修复审计仍待确认；可重复本操作补记，不要重跑审批。")
+    return {"ok": True, "unchanged": unchanged, "record_id": before["record_id"], "link": link,
             "approval_record_id": approval["record_id"], "app_id": FINANCE_ASSISTANT_APP_ID}
 
 
