@@ -19,10 +19,11 @@ CLOSED = {"已补件", "确认例外", "已关闭", "审计误报撤销"}
 def api(a, token, method, path, body=None):
     response = a.requests.request(method, a.FEISHU + path,
         headers={"Authorization": "Bearer " + token}, json=body, timeout=30)
-    response.raise_for_status()
     result = response.json()
     if result.get("code") != 0:
-        raise a.HTTPException(502, "沃尔玛业务读写失败，飞书错误码 " + str(result.get("code")))
+        raise a.HTTPException(502, {"message":"沃尔玛业务读写失败", "feishu_code":result.get("code"),
+                                  "api_message":str(result.get("msg") or "")[:600]})
+    response.raise_for_status()
     return result.get("data") or {}
 
 
