@@ -4409,7 +4409,10 @@ async def finance_assistant_r7_monthly_report(request: Request):
 
 @app.get("/health")
 def health():
+    with open(os.path.join(os.path.dirname(__file__), "walmart_monthly.py"), "rb") as source:
+        walmart_revision = hashlib.sha256(source.read()).hexdigest()
     return {"ok": True, "ml_operating_snapshot_bound_20260908": True,
+            "walmart_monthly_code_sha256": walmart_revision,
             "walmart_finance_group_department_20261009": True,
             "walmart_finance_assistant_20261009": True,
             "walmart_finance_minimal_scopes_20261009": True,
