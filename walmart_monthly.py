@@ -56,7 +56,10 @@ def save(a, token, table, record, fields):
     updated = data.get("record") or {}
     if not updated.get("record_id"):
         raise a.HTTPException(502, "沃尔玛台账未返回保存回执")
-    return updated
+    # Bitable PUT may return only the changed fields. Preserve immutable identity
+    # and the rest of the current record for the next handoff in this request.
+    return {**(record or {}), **updated,
+            "fields":{**((record or {}).get("fields") or {}), **fields, **(updated.get("fields") or {})}}
 
 
 def patch_run(a, token, run, fields=None, **payload_updates):

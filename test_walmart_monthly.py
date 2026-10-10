@@ -206,3 +206,10 @@ class MonthlyTests(unittest.TestCase):
         row=run('AI初审中',monthly_job={'status':'registered','id':'job'})
         with patch.object(m,'finish',return_value={'ok':True}) as finish:
             m.register(app,'FIN',row,{'job_id':'job'});finish.assert_called_once()
+
+    def test_partial_put_receipt_preserves_run_identity(self):
+        row=run()
+        with patch.object(m,'api',return_value={'record':{'record_id':'r','fields':{'报表状态':'待财务终审'}}}):
+            result=m.patch_run(app,'FIN',row,{'报表状态':'待财务终审'},review_version='new')
+            self.assertEqual(result['fields']['run_id'],row['fields']['run_id'])
+            self.assertEqual(app._company_run_payload(result['fields'])['review_version'],'new')
