@@ -3868,7 +3868,15 @@ async def finance_walmart_monthly(request: Request):
                 "message_id":targets[0]["message_id"], "operator_open_id":user["open_id"],
                 "card_form_value":{"reason":"隔离回放：复核测试表；不修改真实报表或审批", "resolution":"recheck"}})
         if mode == "finish":
-            return monthly.finish(sys.modules[__name__], T, run)
+            try:
+                return monthly.finish(sys.modules[__name__], T, run)
+            except HTTPException:
+                raise
+            except Exception as exc:
+                import traceback
+                frames = traceback.extract_tb(exc.__traceback__)
+                raise HTTPException(502, {"error_type":type(exc).__name__,
+                    "location":[{"function":f.name,"line":f.lineno} for f in frames[-3:]]})
         if mode == "register":
             return monthly.register(sys.modules[__name__], T, run, body)
         if mode == "failure":
