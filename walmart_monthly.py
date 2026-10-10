@@ -101,7 +101,7 @@ def begin(a, token, period):
     if not run:
         run = save(a, token, a.COMPANY_RUN_TBL, None, {"run_id": run_id, "期间": period,
             "平台": "沃尔玛", "data_mode": "api", "总表状态": "未灌", "P0数量": "0",
-            "payload_json": json.dumps({"platform_id": "walmart", "report_period": period})})
+            "payload_json": json.dumps({"platform_id": "walmart", "report_period": period, "monthly_workflow":VERSION})})
     f = run["fields"]
     p = a._company_run_payload(f)
     state = a.ft(f.get("报表状态"))
@@ -355,6 +355,9 @@ def recover(a, token):
         f = run["fields"]
         p = a._company_run_payload(f)
         if p.get("platform_id") != "walmart" or a._company_is_smoke_run(f, a.ft(f.get("run_id"))):
+            continue
+        if not any(p.get(k) for k in ("monthly_workflow", "monthly_job", "monthly_validation")):
+            # Historical rows from other orchestrators are not new monthly retry jobs.
             continue
         state = a.ft(f.get("报表状态"))
         if state == "已归档":

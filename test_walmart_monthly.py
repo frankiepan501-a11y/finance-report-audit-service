@@ -213,3 +213,9 @@ class MonthlyTests(unittest.TestCase):
             result=m.patch_run(app,'FIN',row,{'报表状态':'待财务终审'},review_version='new')
             self.assertEqual(result['fields']['run_id'],row['fields']['run_id'])
             self.assertEqual(app._company_run_payload(result['fields'])['review_version'],'new')
+
+    def test_recovery_does_not_dispatch_historical_legacy_runs(self):
+        row=run('P0待处理',monthly_job={})
+        with patch.object(m,'records',return_value=[row]),patch.object(app,'_last_month',return_value='2026-10'), \
+             patch.object(m,'recover_one') as work:
+            m.recover(app,'FIN');work.assert_not_called()
