@@ -3,7 +3,7 @@
 检查: 数据缺漏(空报表) / 采购成本覆盖(有销售但cg=0) / 物流头程覆盖。
 异常 → 飞书卡片发财务部 + Frankie, 列 渠道/店铺/负责人/异常, 让财务跟运营核实。
 口径: 只 flag「销售额>0 且 成本=0」(真异常); 销售=0的0成本行忽略。"""
-import os, json, datetime, hashlib, time, re, threading, uuid
+import os, sys, json, datetime, hashlib, time, re, threading, uuid
 from collections import defaultdict
 import requests
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
@@ -920,6 +920,10 @@ def _company_refresh_report_link(T, run):
     run_id = ft(fields.get("run_id"))
     payload = _company_run_payload(fields)
     platform_id = ft(payload.get("platform_id"))
+    if platform_id == "walmart":
+        # Monthly drafts are bound by the generator. The official index is the
+        # last approved report and must never replace an unapproved draft.
+        return run
     period = ft(fields.get("期间"))
     if not (run_id and platform_id and period):
         return run
@@ -1106,6 +1110,10 @@ def _bt_write(T, tbl, fields, key_field=None):
 def _company_seed_run(T, period, platform_id, *, override=None, report_period=None):
     platform_id, meta = _company_platform_meta(platform_id, period=period, report_period=report_period)
     run_id = _company_run_id(period, platform_id)
+    if platform_id == "walmart":
+        existing = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id)
+        if existing:
+            return existing
     report_link = _company_report_link(T, period, platform_id, report_period=report_period)
     fields = {
         "run_id": run_id,
@@ -1381,6 +1389,14 @@ def _company_aggregate_gate(T, ym_dash, report_field):
             "why": f"等待财务终审: 报表状态={report_status or '-'}; 总表状态={total_status or '-'}",
             "delete_stale": True,
         }
+    payload = _company_run_payload(fields)
+    if platform_id == "walmart" and payload.get("monthly_validation"):
+        import walmart_monthly
+        errors, current_hash = walmart_monthly.check_sheet(sys.modules[__name__], T, rec)
+        approved_hash = (payload.get("monthly_approval") or {}).get("sheet_hash")
+        if errors or not approved_hash or approved_hash != current_hash:
+            return {"allow": False, "run_id": run_id, "delete_stale": False,
+                    "why": "沃尔玛报表与真人批准时的内容不一致，保留已发布数据，停止汇总"}
     return {"allow": True, "run_id": run_id, "run": rec, "report_status": report_status, "total_status": total_status}
 
 
@@ -1457,15 +1473,30 @@ def _company_aggregate_run(T, run_id, *, archive=False):
 
     out_fields = _agg_fields(ym_dash, cat, plat, shop, brand, a, report_link, ptype)
     act = _agg_upsert(T, ym_dash, cat, plat, shop, out_fields)
+    if payload.get("platform_id") == "walmart":
+        import walmart_monthly
+        totals = [r for r in walmart_monthly.records(sys.modules[__name__], T, TOTAL_TBL)
+                  if ft(r["fields"].get("月份")) == ym_dash
+                  and ft(r["fields"].get("渠道大类")) == cat and ft(r["fields"].get("店铺")) == shop]
+        if len(totals) != 1 or any(
+                (_aggnum(totals[0]["fields"].get(k)) != _aggnum(v)) if isinstance(v, (int, float)) or v is None
+                else totals[0]["fields"].get(k) != v for k, v in out_fields.items()):
+            return {"ok": False, "run_id": run_id, "reason": "公司总表写后回读不一致，保留终审并等待自动重试"}
     _company_mark_aggregate_loaded(T, gate)
     index_archive = None
     if archive:
         archive_ms = _now_ms()
+        if payload.get("platform_id") == "walmart":
+            index_archive = _company_mark_index_finalized(T, fields, archive_ms)
+            if not index_archive.get("ok"):
+                return {"ok": False, "run_id": run_id, "reason": "正式索引尚未写入，保留已灌总表状态等待自动重试",
+                        "index_archive": index_archive}
         _company_update_run(T, run_id, {"报表状态": "已归档", "当前阻断方": "已完成",
                                         "总表状态": "已灌总表",
                                         "最后动作": "company_profit_archive_completed",
                                         "最后动作时间": str(archive_ms)})
-        index_archive = _company_mark_index_finalized(T, fields, archive_ms)
+        if index_archive is None:
+            index_archive = _company_mark_index_finalized(T, fields, archive_ms)
     result = {"ok": True, "run_id": run_id, "shop": shop, "act": act,
               "sales": round(a["sales"]), "margin": round(a["margin"]),
               "payback": round(a["payback"]), "archived": archive}
@@ -2310,6 +2341,9 @@ def _company_audit_run_cycle(T, run, *, source_action="run_month"):
     before = {"run": (run or {}).get("fields", {})}
     fields = before["run"]
     run_id = ft(fields.get("run_id"))
+    if (_company_run_payload(fields).get("platform_id") == "walmart"
+            and ft(fields.get("报表状态")) in ("财务通过", "已灌总表", "已归档")):
+        return {"ok": True, "run": run, "status": "closed_preserved", "open_p0": 0}
     report_link = ft(fields.get("报表链接"))
     if not run_id:
         return {"ok": False, "run": run, "status": "invalid", "message": "run_id missing"}
@@ -2551,6 +2585,9 @@ def _company_rerun_run(T, run_id, *, send_next=False, recipient_mode="frankie",
     run = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id)
     if not run:
         return {"ok": False, "status": "not_found", "message": f"run not found: {run_id}"}
+    if (_company_run_payload(run.get("fields", {})).get("platform_id") == "walmart"
+            and ft(run["fields"].get("报表状态")) in ("财务通过", "已灌总表", "已归档")):
+        return {"ok": True, "run": run, "status": "closed_preserved", "open_p0": 0}
     _company_update_run(T, run_id, {"报表状态": "AI生成中", "当前阻断方": "AI自动化",
                                     "最后动作": f"{source_action}_rerun_started"})
     run = _bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or run
@@ -2781,6 +2818,13 @@ def _company_finance_card(T, run, *, test_mode=False, test_note=None):
                                 "头程成本单列，配送、仓储等履约费用包含在广告/平台及履约费中。"
                                 "财务部群和员工私聊是同一份审核，任一处处理后会同步结果，无需重复点击。"),
                      {"tag": "hr"}]
+        coverage = _company_run_payload(rf).get("coverage") or {}
+        missing = coverage.get("missingSettlementStores") or []
+        if missing:
+            pending = "；".join(f"{x.get('storeName')}：订单口径 {x.get('salesQty', 0)} 件" for x in missing)
+            elements += [_company_md("**结算覆盖提醒（请财务核对）**\n" + pending +
+                "。这些店在本月结算毛利接口中没有数据，未计入本表；不能据此认定无业务或已经结算。"
+                "请核结算月份后选择终审通过或退回；需要原件时只补具体差异材料。"), {"tag":"hr"}]
     if report_link:
         elements.append({"tag": "action", "actions": [_company_link_button("打开毛利报表", report_link)]})
         elements.append({"tag": "hr"})
@@ -3037,6 +3081,12 @@ def _handle_company_callback_locked(body, *, delivery_identity):
         if reason:
             # Do not overwrite a valid group card on unauthorized/stale clicks.
             return {"ok": False, "ignored": True, "message": reason, "run_id": run_id}
+        if _company_run_payload(current).get("monthly_validation"):
+            import walmart_monthly
+            errors, current_hash = walmart_monthly.check_sheet(sys.modules[__name__], T, current_record)
+            if errors or current_hash != _company_run_payload(current).get("reviewed_sheet_hash"):
+                refreshed = walmart_monthly.finish(sys.modules[__name__], T, current_record)
+                return {"ok": False, "ignored": True, "message": "报表内容已变化，已重新核验并更新卡片，请查看后再操作。", "refresh": refreshed}
     if _company_audit_exists(T, idempotency_key):
         current_run = (_bt_find(T, COMPANY_RUN_TBL, "run_id", run_id) or {}).get("fields", {})
         current_gap = (_bt_find(T, COMPANY_GAP_TBL, "gap_id", gap_id) or {}).get("fields", {}) if gap_id else {}
@@ -3100,7 +3150,16 @@ def _handle_company_callback_locked(body, *, delivery_identity):
             result_message = "这张终审卡还没有绑定毛利报表链接，不能确认通过。"
         else:
             update_fields, result_message = _company_mark_finance_approved(T, run_id, before_run)
-            _company_update_run(T, run_id, update_fields)
+            if walmart_finance and _company_run_payload(before_run).get("monthly_validation"):
+                import walmart_monthly
+                approval = {"actor_open_id": ctx["operator_open_id"], "at": _now_ms(),
+                            "message_id": ctx["message_id"], "review_key": _company_walmart_review_key(before_run),
+                            "sheet_hash": _company_run_payload(before_run).get("reviewed_sheet_hash")}
+                current_record = walmart_monthly.patch_run(sys.modules[__name__], T, current_record, update_fields,
+                                                            monthly_approval=approval)
+                before_run = current_record["fields"]
+            else:
+                _company_update_run(T, run_id, update_fields)
             if not _company_is_smoke_run(before_run, run_id):
                 aggregate_result = _company_aggregate_run(T, run_id, archive=True)
                 if aggregate_result.get("ok"):
@@ -3116,6 +3175,11 @@ def _handle_company_callback_locked(body, *, delivery_identity):
                                         "P0数量": str(max(1, _company_open_p0_count(T, run_id))),
                                         "最后动作": action})
         result_message = "已退回处理问题，暂时不会写入公司总毛利表。"
+        if walmart_finance:
+            import walmart_monthly
+            reason = str(ctx["form_value"].get("return_reason") or "").strip()
+            walmart_monthly.issue(sys.modules[__name__], T, current_record, "finance_return",
+                "财务终审退回。" + ("问题：" + reason if reason else "请在缺口卡填写问题、修改位置和证据，再提交自动复核。"))
     else:
         ok = False
         result_message = "这张卡片的按钮动作无法识别，请联系 AI 自动化处理。"
@@ -3143,6 +3207,9 @@ def _handle_company_callback_locked(body, *, delivery_identity):
                                    result_message, ok=ok, details=result_details)
     patched = {} if walmart_finance else _patch_or_fallback(ctx, card)
     synced = _company_walmart_sync_result(T, {**current_record, "fields": after_run}, card) if walmart_finance else []
+    if walmart_finance and action == "company_profit_finance_return":
+        import walmart_monthly
+        walmart_monthly.send_gaps(sys.modules[__name__], T, {**current_record, "fields": after_run})
     return {"ok": ok, "action": action, "run_id": run_id, "patch": patched,
             "finance_card_sync": synced}
 
@@ -3226,6 +3293,9 @@ async def profit_workflow_run_month(request: Request):
     for pid in platform_ids:
         run = _company_seed_run(T, period, pid, report_period=report_period)
         run_id = ft((run or {}).get("fields", {}).get("run_id"))
+        if pid == "walmart" and ft(run["fields"].get("报表状态")) in {"财务通过", "已灌总表", "已归档"}:
+            results.append({"platform": pid, "run_id": run_id, "status": "closed_preserved"})
+            continue
         generator_status = _company_generator_status((run.get("fields") or {}), T=T)
         async_generate = _company_async_generation_requested(q, generator_status)
         if generate and async_generate and generator_status.get("ready"):
@@ -3657,6 +3727,10 @@ async def finance_assistant_r5_sample(request: Request):
 
 def _finance_walmart_callback_safe(body):
     try:
+        if _company_callback_context(body)["value"].get("action") == "walmart_monthly_resume":
+            import walmart_monthly
+            with _WALMART_FINANCE_LOCK:
+                return walmart_monthly.resume(sys.modules[__name__], body)
         return _handle_company_callback(body, delivery_identity="finance_assistant")
     except Exception as exc:
         # No raw payload/token in logs; a scoped retry reads the recorded business state.
@@ -3764,6 +3838,47 @@ def _finance_walmart_record(T, record_id):
         seen.add(page)
 
 
+@app.post("/finance-assistant/walmart/monthly")
+async def finance_walmart_monthly(request: Request):
+    """Only the Walmart generator and its retry schedule use this handoff."""
+    _require_internal_auth(request)
+    import walmart_monthly as monthly
+    body = await request.json()
+    mode = body.get("mode", "status")
+    T = finance_assistant_tok()
+    with _WALMART_FINANCE_LOCK:
+        if mode == "recover":
+            return monthly.recover(sys.modules[__name__], T)
+        if mode == "begin":
+            return monthly.begin(sys.modules[__name__], T, str(body.get("period") or _last_month()))
+        run = monthly.find(sys.modules[__name__], T, COMPANY_RUN_TBL, "run_id", str(body.get("run_id") or ""))
+        if not run or _company_run_payload(run["fields"]).get("platform_id") != "walmart":
+            raise HTTPException(404, "Walmart run not found")
+        if mode == "smoke_resume":
+            fields = run["fields"]
+            targets = [r for r in (_company_run_payload(fields).get("walmart_gap_delivery") or {}).get("targets", {}).values() if r.get("active")]
+            if (not _company_is_smoke_run(fields, ft(fields.get("run_id"))) or len(targets) != 1
+                    or targets[0].get("id") != FRANKIE_UNION_ID):
+                raise HTTPException(409, "仅允许隔离测试且唯一目标为Frankie的缺口卡回放")
+            user = _finance_walmart_get(T, "/contact/v3/users/" + FRANKIE_UNION_ID + "?user_id_type=union_id").get("user") or {}
+            if user.get("union_id") != FRANKIE_UNION_ID or not user.get("open_id"):
+                raise HTTPException(409, "无法确认测试操作人")
+            return monthly.resume(sys.modules[__name__], {"value": {"action":"walmart_monthly_resume",
+                "run_id":ft(fields["run_id"]), "gap_key":targets[0]["gap_key"]},
+                "message_id":targets[0]["message_id"], "operator_open_id":user["open_id"],
+                "card_form_value":{"reason":"隔离回放：复核测试表；不修改真实报表或审批", "resolution":"recheck"}})
+        if mode == "finish":
+            return monthly.finish(sys.modules[__name__], T, run)
+        if mode == "register":
+            return monthly.register(sys.modules[__name__], T, run, body)
+        if mode == "failure":
+            job = _company_run_payload(run["fields"]).get("monthly_job") or {}
+            if job.get("id") != body.get("job_id") or job.get("status") != "generating":
+                return {"ok": True, "status": "stale_failure_ignored"}
+            return monthly.failure(sys.modules[__name__], T, run, str(body.get("step") or ""))
+        return {"ok": True, "version": monthly.VERSION, "run": run}
+
+
 @app.post("/finance-assistant/walmart/review")
 async def finance_walmart_review(request: Request):
     """Scoped preflight/send/status; defaults to read-only and never regenerates the report."""
@@ -3804,7 +3919,10 @@ async def finance_walmart_review(request: Request):
         operator = user.get("open_id")
         if not operator or user.get("union_id") != FRANKIE_UNION_ID:
             raise HTTPException(409, "Unable to verify test operator in Finance App namespace")
-        value = {"action": "company_profit_finance_approve", "run_id": run_id,
+        decision = body.get("decision", "approve")
+        if decision not in ("approve", "return"):
+            raise HTTPException(400, "invalid smoke decision")
+        value = {"action": "company_profit_finance_" + decision, "run_id": run_id,
                  "walmart_review_key": _company_walmart_review_key(fields), "delivery_identity": "finance_assistant"}
         return _finance_walmart_callback_safe({"value": value, "operator_open_id": operator,
                                                "message_id": target["message_id"]})
@@ -3844,7 +3962,7 @@ async def finance_assistant_r5_callback(request: Request, background_tasks: Back
     ctx = callback_context(body)
     value = ctx["value"]
     if (value.get("delivery_identity") == "finance_assistant"
-            and value.get("action") in ("company_profit_finance_approve", "company_profit_finance_return")):
+            and value.get("action") in ("company_profit_finance_approve", "company_profit_finance_return", "walmart_monthly_resume")):
         # Acknowledge promptly; the existing financial operation may exceed Feishu's callback timeout.
         background_tasks.add_task(_finance_walmart_callback_safe, body)
         return {"toast": {"type": "info", "content": "已收到操作，财务助手正在核验；处理结果会更新到卡片。"}}
@@ -4288,7 +4406,8 @@ def health():
             "walmart_finance_assistant_20261009": True,
             "walmart_finance_minimal_scopes_20261009": True,
             "walmart_finance_record_listing_20261009": True,
-            "walmart_final_index_link_20261010": True}
+            "walmart_final_index_link_20261010": True,
+            "walmart_monthly_handoff_20261010": True}
 
 
 @app.post("/audit")
