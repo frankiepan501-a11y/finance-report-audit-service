@@ -1575,6 +1575,8 @@ def _company_mark_index_finalized(T, run_fields, archive_ms):
         ),
         "财务收口完成时间": archive_ms,
     }
+    if platform_id == "walmart":
+        fields["沃尔玛毛利报表"] = _company_walmart_final_link(run_fields)
     if version_field:
         fields[version_field] = COMPANY_REPORT_FINAL_VERSION
     try:
@@ -3667,6 +3669,61 @@ def _finance_walmart_get(T, path):
     return result.get("data") or {}
 
 
+def _company_walmart_final_link(fields):
+    payload = _company_run_payload(fields)
+    url = ft(fields.get("报表链接"))
+    if (payload.get("platform_id") != "walmart"
+            or ft(fields.get("报表状态")) not in COMPANY_AGG_APPROVED_STATUSES
+            or not url or url != payload.get("review_url")):
+        raise HTTPException(409, "未找到财务已确认且版本一致的沃尔玛报表，停止更新索引。")
+    period = ft(payload.get("report_period")) or ft(fields.get("期间"))
+    return {"link": url, "text": f"沃尔玛毛利表-{period}-财务终稿"}
+
+
+def _finance_walmart_repair_index(T, fields):
+    """Replay only the missing index link; never approve, aggregate or send cards."""
+    link = _company_walmart_final_link(fields)
+    run_id = ft(fields.get("run_id"))
+    if (ft(fields.get("报表状态")) != "已归档" or ft(fields.get("总表状态")) != "已灌总表"
+            or ft(fields.get("P0数量")) != "0"):
+        raise HTTPException(409, "只能补齐已终审、已汇总并归档的索引链接。")
+    approval = None
+    for record in _bitable_all(T, IDX_APP, COMPANY_AUDIT_TBL):
+        f = record.get("fields", {})
+        if (ft(f.get("run_id")) != run_id or ft(f.get("action")) != "company_profit_finance_approve"
+                or ft(f.get("result")) != "ok" or not ft(f.get("source_message_id"))
+                or ft(f.get("actor_open_id")) in ("", "system")):
+            continue
+        value = _company_run_payload(f).get("value") or {}
+        if (value.get("delivery_identity") == "finance_assistant"
+                and value.get("walmart_review_key") == _company_walmart_review_key(fields)):
+            approval = record
+            break
+    if not approval:
+        raise HTTPException(409, "缺少与当前版本匹配的财务助手真人终审记录。")
+    period = ft(_company_run_payload(fields).get("report_period")) or ft(fields.get("期间"))
+    before = _idx_find_record(T, period.replace("-", "/"))
+    if not before:
+        raise HTTPException(404, "对应月份索引不存在。")
+    if (before.get("fields", {}).get("沃尔玛毛利报表") or {}).get("link") == link["link"]:
+        return {"ok": True, "unchanged": True, "record_id": before["record_id"]}
+    response = requests.put(
+        f"{FEISHU}/bitable/v1/apps/{IDX_APP}/tables/{IDX_TBL}/records/{before['record_id']}",
+        headers={"Authorization": f"Bearer {T}", "Content-Type": "application/json"},
+        json={"fields": {"沃尔玛毛利报表": link}}, timeout=20).json()
+    if response.get("code") != 0:
+        raise HTTPException(502, {"feishu_code": response.get("code"), "message": "正式索引链接写入失败。"})
+    after = _idx_find_record(T, period.replace("-", "/"))
+    if not after or (after.get("fields", {}).get("沃尔玛毛利报表") or {}).get("link") != link["link"]:
+        raise HTTPException(502, "正式索引链接回读不一致，请先核查，不要重跑财务审批。")
+    _company_write_system_audit(T, "walmart_final_index_link_repaired", run_id,
+                                {"沃尔玛毛利报表": before["fields"].get("沃尔玛毛利报表")},
+                                {"沃尔玛毛利报表": link}, {"approval_record_id": approval["record_id"]},
+                                "ok", target_type="index", target_id=before["record_id"])
+    return {"ok": True, "record_id": before["record_id"], "link": link,
+            "approval_record_id": approval["record_id"], "app_id": FINANCE_ASSISTANT_APP_ID}
+
+
 def _finance_walmart_record(T, record_id):
     # The approved base:record:retrieve permission supports listing records.
     # Single-record GET requests a different scope; keep the existing scope.
@@ -3693,7 +3750,7 @@ async def finance_walmart_review(request: Request):
     _require_internal_auth(request)
     body = await request.json()
     mode = body.get("mode", "preflight")
-    if mode not in ("preflight", "send", "status", "smoke_replay"):
+    if mode not in ("preflight", "send", "status", "smoke_replay", "repair_index"):
         raise HTTPException(400, "invalid mode")
     run_id = str(body.get("run_id") or "")
     if not FINANCE_ASSISTANT_VERIFICATION_TOKEN or FINANCE_ASSISTANT_ENCRYPT_KEY:
@@ -3707,6 +3764,10 @@ async def finance_walmart_review(request: Request):
         raise HTTPException(404, "Walmart run not found")
     fields = run["fields"]
     delivery = _company_run_payload(fields).get("walmart_finance_delivery") or {}
+    if mode == "repair_index":
+        with _WALMART_FINANCE_LOCK:
+            current = _finance_walmart_record(T, run["record_id"])
+            return _finance_walmart_repair_index(T, current["fields"])
     if mode == "status":
         messages = []
         for target in delivery.get("targets", {}).values():
@@ -4206,7 +4267,8 @@ def health():
             "walmart_finance_group_department_20261009": True,
             "walmart_finance_assistant_20261009": True,
             "walmart_finance_minimal_scopes_20261009": True,
-            "walmart_finance_record_listing_20261009": True}
+            "walmart_finance_record_listing_20261009": True,
+            "walmart_final_index_link_20261010": True}
 
 
 @app.post("/audit")

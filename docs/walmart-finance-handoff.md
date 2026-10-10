@@ -1,5 +1,13 @@
 # Walmart finance handoff — 2026-10-09
 
+## 2026-10-10 final index correction
+
+The first real Finance Assistant approval completed aggregation and archive, but the official index still linked the old sheet: `_company_mark_index_finalized` updated status/time only. Walmart finalization now publishes the run's approved `review_url` together with its final status. No other platform's link changes.
+
+For an already archived Walmart run, internal `mode=repair_index` verifies a matching successful human approval in the Finance Assistant audit ledger and writes only the Walmart index link. It does not re-approve, regenerate, aggregate, send messages, or replace the original archive timestamp. It reads back the link and records the previous link plus approval record ID in a separate repair audit; repeated calls with the correct link do not write. The old sheet remains intact.
+
+Verification: `test_walmart_final_index.py` first reproduced the missing URL, then covered approval/version gates, failed writes, Finance identity, and repeated calls. Deployment sentinel: `walmart_final_index_link_20261010=true`. September readback evidence and production correction receipt live under the parent project's `outputs/walmart-2026-09-p0-20261009/closeout/`.
+
 ## Identity correction confirmed by user
 
 The previous Event App choice was an implementation error: the user had already assigned Finance work to 财务助手 (`cli_aa1d52694f61dbc1`). For Walmart final review, new cards, contact lookup, ledger operations, callbacks and result PATCH use that App. Old Event App credentials are used only to close its already-issued cards. Other channels remain an explicit migration backlog, not a claim of completed Finance-domain rollout.
